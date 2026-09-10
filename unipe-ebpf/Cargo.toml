@@ -1,0 +1,19 @@
+[package]
+name = "unipe-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+unipe-common = { path = "../unipe-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+network-types = "0.2.0"
+memoffset = "0.9.1"
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "unipe"
+path = "src/main.rs"

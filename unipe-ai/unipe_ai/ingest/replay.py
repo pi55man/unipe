@@ -32,7 +32,7 @@ class ReplaySource:
                     continue
                 batch = json.loads(line)
                 if not isinstance(batch, list):
-                    raise ValueError("each replay line must be a JSON array of flows")
+                    raise TypeError("each replay line must be a JSON array of flows")
                 yield batch
                 if self.tick_secs > 0:
                     time.sleep(self.tick_secs)

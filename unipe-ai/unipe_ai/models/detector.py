@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +18,15 @@ from unipe_ai.util import clamp
 
 _DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "default.toml"
 
-# how much of the final confidence comes from the trained model vs the rule
+# how much of the gap to certainty the model can close when it agrees with a rule
 _MODEL_WEIGHT = 0.4
+
+
+@dataclass(frozen=True)
+class DetectorConfig:
+    # below this we are saying "probably not", so don't spend an analyst's
+    # attention on it. blending in a low model score can push a weak rule here.
+    min_confidence: float = 0.5
 
 FLOOD_SUBTYPES = {"udp_flood", "syn_flood", "fan_in_flood", "icmp_flood"}
 SPOOF_NOISE_SUBTYPES = {"martian_source", "martian_source_storm", "land_attack"}
@@ -30,6 +37,7 @@ class Detector:
 
     def __init__(self, config_path: Path | None = None, model_path: Path | None = None) -> None:
         configs = _load_configs(config_path or _DEFAULT_CONFIG)
+        self.detector_cfg: DetectorConfig = configs["detector"]
         self.volumetric_cfg: VolumetricConfig = configs["volumetric"]
         self.spoofing_cfg: SpoofingConfig = configs["spoofing"]
         self.beaconing_cfg: BeaconingConfig = configs["beaconing"]
@@ -59,6 +67,7 @@ class Detector:
         )
         alerts = _dedupe(alerts)
         self._apply_model(alerts, features)
+        alerts = [a for a in alerts if a["confidence"] >= self.detector_cfg.min_confidence]
         alerts.sort(
             key=lambda a: (SEVERITY_ORDER.get(a["severity"], 0), a["confidence"]),
             reverse=True,
@@ -85,7 +94,12 @@ class Detector:
                 probability = by_dst.get(alert["dst_ip"])
             if probability is None:
                 continue
-            blended = (1 - _MODEL_WEIGHT) * alert["confidence"] + _MODEL_WEIGHT * probability
+            # The model reads flow shape, so it knows about floods and scans but
+            # has no opinion on, say, a TLS version. Averaging let it veto those
+            # rules down below the reporting gate, so it now only confirms:
+            # agreement closes some of the gap to 1.0, disagreement changes nothing.
+            headroom = 1.0 - alert["confidence"]
+            blended = alert["confidence"] + _MODEL_WEIGHT * probability * headroom
             alert["confidence"] = round(clamp(blended, 0.0, 1.0), 3)
             alert["evidence"]["ml_probability"] = round(probability, 3)
 
@@ -119,6 +133,7 @@ def _dedupe(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 _CONFIG_SECTIONS: dict[str, Any] = {
+    "detector": DetectorConfig,
     "volumetric": VolumetricConfig,
     "spoofing": SpoofingConfig,
     "beaconing": BeaconingConfig,
@@ -168,15 +183,26 @@ def _parse_simple_toml(text: str) -> dict[str, dict[str, Any]]:
     """fallback for a malformed file or a python without tomllib."""
     sections: dict[str, dict[str, Any]] = {}
     current: str | None = None
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+    pending = ""  # an array value can run over several lines
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
             continue
-        if line.startswith("[") and line.endswith("]"):
+        if pending:
+            pending += " " + line
+            if pending.count("[") <= pending.count("]"):
+                key, value = [p.strip() for p in pending.split("=", 1)]
+                sections[current][key] = _coerce(value)
+                pending = ""
+            continue
+        if line.startswith("[") and line.endswith("]") and "=" not in line:
             current = line[1:-1].strip()
             sections.setdefault(current, {})
             continue
         if current is None or "=" not in line:
+            continue
+        if line.count("[") > line.count("]"):
+            pending = line
             continue
         key, value = [p.strip() for p in line.split("=", 1)]
         sections[current][key] = _coerce(value)
@@ -184,7 +210,11 @@ def _parse_simple_toml(text: str) -> dict[str, dict[str, Any]]:
 
 
 def _coerce(value: str) -> Any:
-    value = value.split("#", 1)[0].strip().strip('"').strip("'")
+    value = value.split("#", 1)[0].strip()
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        return [_coerce(p) for p in inner.split(",") if p.strip()] if inner else []
+    value = value.strip('"').strip("'")
     if value.lower() in {"true", "false"}:
         return value.lower() == "true"
     try:

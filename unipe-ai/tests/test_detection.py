@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import socket
+import ssl
+import threading
+
+import pytest
+
 from unipe_ai.alerts import SCHEMA_VERSION
+from unipe_ai.engine import TapDirection
 from unipe_ai.features.extract import extract
+from unipe_ai.features.payload import GREASE, parse_tls
 from unipe_ai.features.window import FlowWindow
 from unipe_ai.models.beaconing import BeaconingConfig, BeaconTracker
 from unipe_ai.models.detector import Detector
-from unipe_ai.models.dnsabuse import detect_dns_abuse
-from unipe_ai.models.encrypted import detect_encrypted
+from unipe_ai.models.dnsabuse import DnsConfig, _dga_signals, detect_dns_abuse
+from unipe_ai.models.encrypted import EncryptedConfig, detect_encrypted
 from unipe_ai.models.exfiltration import ExfiltrationConfig, detect_exfiltration
 from unipe_ai.models.scanning import ScanningConfig, detect_scanning
 from unipe_ai.models.spoofing import SpoofingConfig, detect_spoofing
@@ -410,15 +419,149 @@ def test_beaconing_ignores_irregular_traffic():
     assert not alerts
 
 
+def test_beaconing_works_from_the_inbound_direction_alone():
+    """XDP is receive-only, so the outbound half may never be observed.
+
+    The beacon still has to be found, and reported oriented local -> remote
+    whichever direction the tap happened to carry.
+    """
+    tracker = BeaconTracker(BeaconingConfig(min_intervals=4, alert_cooldown_s=0.0))
+    inbound = _flow(
+        src_ip="185.220.101.7",
+        dst_ip="192.168.1.35",
+        src_port=8080,
+        dst_port=57270,
+        packets=4,
+        bytes=800,
+    )
+    alerts = []
+    for i in range(6):
+        alerts = tracker.update([inbound], now=1000.0 + i * 15.0)
+    assert len(alerts) == 1
+    assert alerts[0]["src_ip"] == "192.168.1.35"
+    assert alerts[0]["dst_ip"] == "185.220.101.7"
+    assert alerts[0]["dst_port"] == 8080
+
+
+def test_beaconing_counts_a_mirrored_conversation_once():
+    """On a tap carrying both directions the two halves must not double-count."""
+    tracker = BeaconTracker(BeaconingConfig(min_intervals=4, alert_cooldown_s=0.0))
+    out = _flow(
+        src_ip="192.168.1.35", dst_ip="185.220.101.7",
+        src_port=57270, dst_port=8080, packets=4, bytes=400,
+    )
+    back = _flow(
+        src_ip="185.220.101.7", dst_ip="192.168.1.35",
+        src_port=8080, dst_port=57270, packets=4, bytes=400,
+    )
+    alerts = []
+    for i in range(6):
+        alerts = tracker.update([out, back], now=1000.0 + i * 15.0)
+    assert len(alerts) == 1
+
+
+def test_beaconing_ignores_a_conversation_that_ever_carried_real_traffic():
+    """One heavy window means a keepalive on a real session, not a beacon."""
+    tracker = BeaconTracker(BeaconingConfig(min_intervals=4, alert_cooldown_s=0.0))
+    quiet = _flow(
+        src_ip="192.168.1.35", dst_ip="172.217.119.4",
+        src_port=57270, dst_port=443, protocol=17, packets=4, bytes=800,
+    )
+    page_load = dict(quiet, packets=900, bytes=1_200_000)
+    alerts = []
+    for i in range(6):
+        batch = [page_load] if i == 1 else [quiet]
+        alerts = tracker.update(batch, now=1000.0 + i * 15.0)
+    assert not alerts
+
+
+def test_beaconing_ignores_lan_peers():
+    tracker = BeaconTracker(BeaconingConfig(min_intervals=4, alert_cooldown_s=0.0))
+    lan = _flow(src_ip="192.168.1.50", dst_ip="192.168.1.1", dst_port=443, packets=4)
+    alerts = []
+    for i in range(6):
+        alerts = tracker.update([lan], now=1000.0 + i * 60.0)
+    assert not alerts
+
+
+def test_one_directional_tap_is_reported():
+    tap = TapDirection()
+    # every flow a reply, which is all an XDP hook on a host's own NIC sees
+    tap.note([_flow(src_port=443, dst_port=40000 + i, is_new_flow=True) for i in range(250)])
+    tap.maybe_warn()
+    assert tap.warned
+    assert tap.to_server == 0
+
+
+def test_two_directional_tap_is_not_reported():
+    tap = TapDirection()
+    both = []
+    for i in range(250):
+        both.append(_flow(src_port=40000 + i, dst_port=443, is_new_flow=True))
+        both.append(_flow(src_port=443, dst_port=40000 + i, is_new_flow=True))
+    tap.note(both)
+    tap.maybe_warn()
+    assert not tap.warned
+
+
+def test_tap_direction_stays_quiet_until_it_has_enough_flows():
+    tap = TapDirection()
+    tap.note([_flow(src_port=443, dst_port=40000 + i, is_new_flow=True) for i in range(10)])
+    tap.maybe_warn()
+    assert not tap.warned
+
+
 def test_dga_domain_is_flagged():
     feat = _dns_flow("kq7bxz1mvhqp3wr.com")
     alerts = detect_dns_abuse([feat])
     assert any(a["subtype"] == "dga_domain" for a in alerts)
 
 
+@pytest.mark.parametrize(
+    "qname",
+    [
+        "xkvhdlqpzmwrtn.biz",
+        "ycxwbmqhtdvkzn.ru",
+        "1qaz2wsx3edc4rfv.net",
+        "ffcjkbrvxqzpmw.info",
+    ],
+)
+def test_more_dga_samples_are_flagged(qname):
+    alerts = detect_dns_abuse([_dns_flow(qname)])
+    assert any(a["subtype"] == "dga_domain" for a in alerts)
+
+
 def test_normal_domain_is_not_flagged():
     alerts = detect_dns_abuse([_dns_flow("www.google.com"), _dns_flow("github.com")])
     assert not alerts
+
+
+@pytest.mark.parametrize(
+    "qname",
+    [
+        # every one of these was a false positive on a live browsing capture
+        "prod.ingestion-edge.prod.dataservices.mozgcp.net",
+        "part-0020.t-0009.fb-t-msedge.net",
+        "mozilla-ohttp.fastly-edge.com",
+        "incoming.telemetry.mozilla.org",
+        "static.xx.fbcdn.net",
+        # a discord snowflake: all digits, so the vowel and bigram signals
+        # fire only because there are no letters to measure
+        "1211781489931452447.discordsays.com",
+        "1758912000000.metrics.example.com",
+    ],
+)
+def test_long_legitimate_hostnames_are_not_dga(qname):
+    alerts = detect_dns_abuse([_dns_flow(qname)])
+    assert not [a for a in alerts if a["subtype"] == "dga_domain"]
+
+
+def test_cdn_hostnames_random_by_design_are_allowlisted():
+    """A CloudFront id really is random, so only its parent domain saves it."""
+    label = "dp0wn1kjwhg75"
+    assert sum(_dga_signals(label, DnsConfig()).values()) >= 3
+    alerts = detect_dns_abuse([_dns_flow(f"{label}.cloudfront.net")])
+    assert not [a for a in alerts if a["subtype"] == "dga_domain"]
 
 
 def test_dns_tunnel_is_flagged():
@@ -448,6 +591,140 @@ def test_legacy_tls_version_is_flagged():
 
 def test_normal_tls_on_443_is_quiet():
     feat = _flow(dst_port=443, protocol=6, payload=_client_hello(0x0303))
+    assert not detect_encrypted([feat])
+
+
+def test_reply_direction_to_an_ephemeral_port_is_not_a_nonstandard_port():
+    """443 -> 49820 is the server answering, not TLS hiding on a weird port."""
+    feat = _flow(src_port=443, dst_port=49820, protocol=6, payload=_client_hello(0x0303))
+    assert not [a for a in detect_encrypted([feat]) if "nonstandard_port" in a["subtype"]]
+
+
+def test_quic_reply_direction_is_not_a_nonstandard_port():
+    feat = _flow(src_port=443, dst_port=49820, protocol=17, payload=_quic_initial())
+    assert not detect_encrypted([feat])
+
+
+def test_quic_on_an_odd_port_is_flagged():
+    """Needs port-independent parsing: we only ever looked at 443 and 80 before."""
+    feat = _flow(src_port=51000, dst_port=4444, protocol=17, payload=_quic_initial())
+    assert [a["subtype"] for a in detect_encrypted([feat])] == ["quic_on_nonstandard_port"]
+
+
+def test_quic_on_443_is_quiet():
+    feat = _flow(src_port=51000, dst_port=443, protocol=17, payload=_quic_initial())
+    assert not detect_encrypted([feat])
+
+
+def test_random_udp_is_not_read_as_quic():
+    """The fixed bit plus a known version keeps stray UDP out of the QUIC path."""
+    feat = _flow(src_port=51000, dst_port=4444, protocol=17, payload="c0deadbeef0102")
+    assert feat["quic_is_initial"] is False
+    assert not detect_encrypted([feat])
+
+
+def test_idle_encrypted_session_is_not_an_alert_on_its_own():
+    """Shape alone cannot tell C2 from a browser keepalive sitting open."""
+    feat = _flow(
+        dst_port=443,
+        protocol=6,
+        payload=_client_hello(0x0303),
+        packets=14,
+        bytes=1092,
+        duration_ms=59_000,
+    )
+    assert not detect_encrypted([feat])
+
+
+# --- JA3 / JA3S fingerprinting --------------------------------------------
+
+
+def test_ja3_is_computed_from_a_complete_client_hello():
+    feat = _flow(dst_port=443, protocol=6, payload=_client_hello())
+    assert feat["tls_sample_complete"] is True
+    # version, ciphers (GREASE dropped), extensions, curves, point formats
+    assert feat["tls_ja3"] == "771,4865-4866-49195,0-10-11-16,29-23,0"
+    assert feat["tls_ja3_hash"] == hashlib.md5(
+        feat["tls_ja3"].encode(), usedforsecurity=False
+    ).hexdigest()
+    assert feat["tls_sni"] == "example.com"
+    assert feat["tls_alpn"] == ("h2",)
+
+
+def test_ja3_is_not_guessed_from_a_truncated_sample():
+    """A hash over half a hello would match nothing, so we must not emit one."""
+    # 50 bytes is 100 hex chars: enough for the headers, not the whole hello
+    feat = _flow(dst_port=443, protocol=6, payload=_client_hello()[:100])
+    assert feat["tls_is_client_hello"] is True
+    assert feat["tls_sample_complete"] is False
+    assert feat["tls_ja3_hash"] == ""
+
+
+def test_ja3s_is_computed_from_the_server_hello():
+    feat = _flow(src_port=443, dst_port=51000, protocol=6, payload=_server_hello())
+    assert feat["tls_is_server_hello"] is True
+    assert feat["tls_ja3s"] == "771,4865,43"
+    assert feat["tls_ja3s_hash"]
+
+
+def test_blocklisted_ja3_is_flagged():
+    feat = _flow(dst_ip="45.9.148.3", dst_port=443, protocol=6, payload=_client_hello())
+    cfg = EncryptedConfig(ja3_blocklist=(feat["tls_ja3_hash"],))
+    alerts = detect_encrypted([feat], cfg)
+    assert any(a["subtype"] == "known_bad_ja3" for a in alerts)
+
+
+def test_tls_without_sni_to_a_public_ip_is_flagged():
+    feat = _flow(dst_ip="45.9.148.3", dst_port=443, protocol=6, payload=_client_hello(sni=""))
+    alerts = detect_encrypted([feat])
+    assert any(a["subtype"] == "tls_without_sni" for a in alerts)
+
+
+def test_ja3_parses_a_real_openssl_client_hello():
+    """Validate against a genuine TLS stack, not just our own encoder."""
+    raw = _capture_real_client_hello()
+    out = parse_tls(raw.hex())
+    assert out["tls_is_client_hello"] is True
+    assert out["tls_sample_complete"] is True
+    assert out["tls_client_version"] == 0x0303
+    assert out["tls_sni"] == "example.com"
+    assert len(out["tls_ciphers"]) > 5
+    assert out["tls_curves"]
+    # five comma-separated fields, and no GREASE survived into any of them
+    fields = out["tls_ja3"].split(",")
+    assert len(fields) == 5
+    assert all(int(v) not in GREASE for v in fields[1].split("-"))
+    assert len(out["tls_ja3_hash"]) == 32
+
+
+def _capture_real_client_hello() -> bytes:
+    """Let python's ssl module talk to a plain socket and grab what it sends."""
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def connect():
+        try:
+            ctx = ssl.create_default_context()
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                ctx.wrap_socket(sock, server_hostname="example.com").do_handshake()
+        except OSError:
+            pass  # the handshake never completes, we only want the first flight
+
+    threading.Thread(target=connect, daemon=True).start()
+    conn, _ = server.accept()
+    try:
+        return conn.recv(8192)
+    finally:
+        conn.close()
+        server.close()
+
+
+def test_payload_is_only_sampled_for_handshakes():
+    """Application data is never captured, so there is nothing to parse."""
+    feat = _flow(dst_port=443, protocol=6, payload="")
+    assert feat["tls_is_handshake"] is False
     assert not detect_encrypted([feat])
 
 
@@ -566,6 +843,21 @@ def test_exfiltration_stays_quiet_without_the_reverse_flow():
     assert detect_exfiltration([outbound], ExfiltrationConfig(require_reverse_flow=False))
 
 
+def test_model_confirms_a_rule_but_never_vetoes_it():
+    """The model reads flow shape and knows nothing about TLS versions.
+
+    Averaging its opinion in used to drag such rules under the reporting gate.
+    """
+    legacy = _flow(
+        src_ip="192.168.1.9", dst_ip="45.9.148.3", dst_port=443,
+        protocol=6, payload=_client_hello(0x0301),
+    )
+    alerts = Detector(config_path=None).score([legacy])
+    version_alerts = [a for a in alerts if a["subtype"] == "legacy_tls_version"]
+    assert version_alerts, "a trained model should not be able to suppress a rule"
+    assert version_alerts[0]["confidence"] >= 0.7
+
+
 def test_detector_wires_up_every_threat_class():
     """One mixed batch through the real Detector, not the modules directly."""
     batch = []
@@ -626,7 +918,9 @@ def test_detector_wires_up_every_threat_class():
         ),
     ]
 
-    classes = {a["threat_class"] for a in Detector(config_path=None).score(batch)}
+    alerts = Detector(config_path=None).score(batch)
+    assert all(a["confidence"] >= 0.5 for a in alerts), "confidence gate leaked a weak alert"
+    classes = {a["threat_class"] for a in alerts}
     # beaconing needs several windows, so it has its own test
     assert classes == {
         "volumetric_ddos",
@@ -688,11 +982,62 @@ def _dns_payload(qname: str, qtype: int = 1) -> str:
     return data.hex()
 
 
-def _client_hello(client_version: int) -> str:
-    """just enough of a TLS ClientHello for the metadata parser."""
+def _ext(ext_type: int, body: bytes) -> bytes:
+    return ext_type.to_bytes(2, "big") + len(body).to_bytes(2, "big") + body
+
+
+def _tls_record(handshake_type: int, body: bytes) -> bytes:
+    handshake = bytes([handshake_type]) + len(body).to_bytes(3, "big") + body
+    return b"\x16\x03\x01" + len(handshake).to_bytes(2, "big") + handshake
+
+
+def _quic_initial(version: int = 0x00000001) -> str:
+    """long header with the fixed bit set and packet type 0 (Initial)."""
+    data = bytearray([0xC0])
+    data += version.to_bytes(4, "big")
+    data += b"\x08" + bytes(8)  # destination connection id
+    return data.hex()
+
+
+def _client_hello(
+    client_version: int = 0x0303,
+    sni: str = "example.com",
+    ciphers: tuple[int, ...] = (0x0A0A, 0x1301, 0x1302, 0xC02B),
+) -> str:
+    """a real ClientHello, complete enough to fingerprint.
+
+    0x0a0a is a GREASE cipher and must be dropped from the JA3.
+    """
     body = bytearray()
-    body.extend(b"\x16\x03\x01\x00\x40")  # record: handshake, tls1.0, length
-    body.extend(b"\x01\x00\x00\x3c")  # handshake: client hello, length
-    body.extend(client_version.to_bytes(2, "big"))
-    body.extend(bytes(32))  # random
-    return body.hex()
+    body += client_version.to_bytes(2, "big")
+    body += bytes(32)  # random
+    body += b"\x00"  # empty session id
+    cipher_bytes = b"".join(c.to_bytes(2, "big") for c in ciphers)
+    body += len(cipher_bytes).to_bytes(2, "big") + cipher_bytes
+    body += b"\x01\x00"  # one compression method: null
+
+    exts = bytearray()
+    if sni:
+        name = sni.encode()
+        entry = b"\x00" + len(name).to_bytes(2, "big") + name
+        exts += _ext(0x0000, len(entry).to_bytes(2, "big") + entry)
+    curves = b"".join(c.to_bytes(2, "big") for c in (0x001D, 0x0017))
+    exts += _ext(0x000A, len(curves).to_bytes(2, "big") + curves)
+    exts += _ext(0x000B, b"\x01\x00")  # ec point formats: uncompressed
+    alpn = b"\x02h2"
+    exts += _ext(0x0010, len(alpn).to_bytes(2, "big") + alpn)
+    body += len(exts).to_bytes(2, "big") + exts
+
+    return _tls_record(0x01, bytes(body)).hex()
+
+
+def _server_hello(server_version: int = 0x0303, cipher: int = 0x1301) -> str:
+    body = bytearray()
+    body += server_version.to_bytes(2, "big")
+    body += bytes(32)  # random
+    body += b"\x00"  # empty session id
+    body += cipher.to_bytes(2, "big")
+    body += b"\x00"  # null compression
+    exts = _ext(0x002B, b"\x03\x04")  # supported_versions: tls 1.3
+    body += len(exts).to_bytes(2, "big") + exts
+    return _tls_record(0x02, bytes(body)).hex()

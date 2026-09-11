@@ -48,6 +48,7 @@ def extract(flow: dict[str, Any]) -> dict[str, Any]:
     feat["dst_is_multicast"] = _is_multicast(dst_ip)
     # True only for routable global unicast (excludes private/multicast/broadcast/martians).
     feat["dst_is_public_unicast"] = _is_public_unicast(dst_ip)
+    feat["src_is_public_unicast"] = _is_public_unicast(src_ip)
     # Observed TTLs are hop-decremented; only TTL 0 is inherently invalid here.
     feat["ttl_suspicious"] = ttl == 0
     src_port = int(_num(flow.get("src_port"), 0.0))
@@ -65,7 +66,9 @@ def extract(flow: dict[str, Any]) -> dict[str, Any]:
         feat.update(parse_dns(payload))
     if feat["is_tcp"]:
         feat.update(parse_tls(payload))
-    if feat["is_udp"] and (src_port in QUIC_PORTS or dst_port in QUIC_PORTS):
+    # not port-gated: parse_quic checks the long-header and fixed bits itself,
+    # and QUIC on an unexpected port is the interesting case
+    if feat["is_udp"] and not feat.get("dns_parsed"):
         feat.update(parse_quic(payload))
     return feat
 

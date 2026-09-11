@@ -2,6 +2,10 @@ socket_path = "/tmp/unipe.sock"
 # the exporter tick, in ms. this is the detection latency budget.
 interval_hint_ms = 250
 
+[detector]
+# drop anything the pipeline is not at least half sure about
+min_confidence = 0.5
+
 [volumetric]
 min_unique_sources = 30
 dst_packet_rate = 5000.0
@@ -36,27 +40,48 @@ min_intervals = 4
 max_jitter_ratio = 0.20
 min_interval_s = 1.0
 max_interval_s = 3600.0
-max_avg_bytes_per_window = 8192.0
+# Gates on the busiest window, not the average: a beacon is small every single
+# time, whereas a keepalive is small only after its page finished loading.
+max_bytes_per_window = 8192.0
 history = 24
 alert_cooldown_s = 300.0
 idle_evict_s = 7200.0
+# Both halves of a conversation fold onto one key, so this works whether the
+# tap carries one direction or both. C2 itself must be off-network.
+external_only = true
 
 [dns]
-dga_min_entropy = 3.6
+# A label must trip this many of the four randomness signals to count as DGA.
+dga_min_signals = 3
+dga_max_bigram_familiarity = 0.35
+dga_min_normalized_entropy = 0.90
+dga_max_vowel_ratio = 0.25
+dga_min_digit_ratio = 0.15
+# An all-digit label (a Discord snowflake, a timestamp, a shard id) has no
+# vowels and no letter pairs for the trivial reason that it has no letters.
+dga_min_letters = 6
 dga_min_label_len = 10
-dga_max_label_len = 32
-tunnel_min_qname_len = 45
+dga_max_label_len = 40
+# CDNs generate random hostnames on purpose, so randomness proves nothing there.
+dga_ignore_parents = [
+  "cloudfront.net", "akamaiedge.net", "akamai.net", "akadns.net",
+  "azureedge.net", "trafficmanager.net", "amazonaws.com",
+  "googleusercontent.com", "1e100.net", "fastly-edge.com",
+  "fbcdn.net", "windowsupdate.com",
+]
+tunnel_min_qname_len = 60
 tunnel_min_label_count = 4
 tunnel_min_entropy = 3.2
 tunnel_min_subdomains = 15
-max_reasonable_qname_len = 50
+max_reasonable_qname_len = 100
 
 [encrypted]
-c2_max_avg_packet_size = 300.0
-c2_min_duration_ms = 30000.0
-c2_max_packets = 400.0
-c2_min_packets = 8.0
+# Checked against both ends of the flow, since the reply direction has the
+# service port as its source.
 alert_nonstandard_port = true
+alert_missing_sni = true
+# JA3 md5 hashes of known-bad clients, e.g. from abuse.ch SSLBL.
+ja3_blocklist = []
 
 [scanning]
 min_ports_per_dst = 20

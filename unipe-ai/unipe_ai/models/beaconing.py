@@ -8,6 +8,7 @@ it keeps state between calls unlike the other ones.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Any
 
 from unipe_ai.alerts import C2_BEACONING, make_alert, make_flow_id
@@ -23,13 +24,15 @@ class BeaconingConfig:
     min_interval_s: float = 1.0
     max_interval_s: float = 3600.0
     # beacons carry little data; bulk transfers are not C2 check-ins
-    max_avg_bytes_per_window: float = 8192.0
+    max_bytes_per_window: float = 8192.0
     # how many activity times to remember per peer
     history: int = 24
     # don't re-raise the same beacon every window
     alert_cooldown_s: float = 300.0
     # forget peers that went quiet
     idle_evict_s: float = 7200.0
+    # C2 lives outside the monitored network
+    external_only: bool = True
 
 
 class BeaconTracker:
@@ -39,30 +42,45 @@ class BeaconTracker:
         self.cfg = cfg or BeaconingConfig()
         self._times: dict[tuple[str, str, int, int], list[float]] = {}
         self._bytes: dict[tuple[str, str, int, int], list[float]] = {}
+        self._packets: dict[tuple[str, str, int, int], list[float]] = {}
         self._last_alert: dict[tuple[str, str, int, int], float] = {}
 
     def update(self, features: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
         # several 5-tuples can share a peer in one window, so total them up first
         # and record a single activity time per peer
-        active: dict[tuple[str, str, int, int], float] = {}
+        active: dict[tuple[str, str, int, int], list[float]] = {}
         for feat in features:
-            if to_float(feat.get("packets")) <= 0:
+            packets = to_float(feat.get("packets"))
+            if packets <= 0 or not self._is_candidate(feat):
                 continue
             key = _key(feat)
-            active[key] = active.get(key, 0.0) + to_float(feat.get("bytes"))
+            totals = active.setdefault(key, [0.0, 0.0])
+            totals[0] += to_float(feat.get("bytes"))
+            totals[1] += packets
 
-        for key, window_bytes in active.items():
+        for key, (window_bytes, window_packets) in active.items():
             times = self._times.setdefault(key, [])
             sizes = self._bytes.setdefault(key, [])
+            counts = self._packets.setdefault(key, [])
             times.append(now)
             sizes.append(window_bytes)
+            counts.append(window_packets)
             del times[: -self.cfg.history]
             del sizes[: -self.cfg.history]
+            del counts[: -self.cfg.history]
 
         # only peers that moved traffic this window can have a new interval
         alerts = [a for a in (self._check(key, now) for key in active) if a]
         self._evict(now)
         return alerts
+
+    def _is_candidate(self, feat: dict[str, Any]) -> bool:
+        if not self.cfg.external_only:
+            return True
+        # whichever endpoint is the far side has to be out on the internet
+        remote_is_dst = to_int(feat.get("dst_port")) <= to_int(feat.get("src_port"))
+        key = "dst_is_public_unicast" if remote_is_dst else "src_is_public_unicast"
+        return bool(feat.get(key))
 
     def _check(self, key: tuple[str, str, int, int], now: float) -> dict[str, Any] | None:
         cfg = self.cfg
@@ -70,7 +88,7 @@ class BeaconTracker:
         if len(times) < cfg.min_intervals + 1:
             return None
 
-        gaps = [b - a for a, b in zip(times, times[1:]) if b > a]
+        gaps = [b - a for a, b in pairwise(times) if b > a]
         if len(gaps) < cfg.min_intervals:
             return None
 
@@ -82,8 +100,12 @@ class BeaconTracker:
         if jitter > cfg.max_jitter_ratio:
             return None
 
+        # Gate on the *busiest* window, not the average. A beacon is small every
+        # single time; a browser keepalive is small only because the page it
+        # belongs to already finished loading. One heavy window says this
+        # conversation carries real traffic and is not a beacon.
         avg_bytes = mean(self._bytes[key])
-        if avg_bytes > cfg.max_avg_bytes_per_window:
+        if max(self._bytes[key]) > cfg.max_bytes_per_window:
             return None
 
         last = self._last_alert.get(key, 0.0)
@@ -91,7 +113,7 @@ class BeaconTracker:
             return None
         self._last_alert[key] = now
 
-        src_ip, dst_ip, dst_port, protocol = key
+        local_ip, remote_ip, service_port, protocol = key
         # a perfectly flat interval is the strongest signal, so invert the jitter
         confidence = clamp(
             0.5 + 0.45 * (1.0 - jitter / max(cfg.max_jitter_ratio, 1e-6)),
@@ -103,14 +125,14 @@ class BeaconTracker:
             subtype="periodic_beacon",
             severity="high" if jitter <= cfg.max_jitter_ratio / 2 else "medium",
             confidence=confidence,
-            flow_id=make_flow_id(protocol, src_ip, "*", dst_ip, dst_port),
+            flow_id=make_flow_id(protocol, local_ip, "*", remote_ip, service_port),
             timestamp=times[-1],
-            src_ip=src_ip,
-            dst_ip=dst_ip,
-            dst_port=dst_port,
+            src_ip=local_ip,
+            dst_ip=remote_ip,
+            dst_port=service_port,
             protocol=protocol,
             message=(
-                f"periodic beacon {src_ip} -> {dst_ip}:{dst_port} every "
+                f"periodic beacon {local_ip} -> {remote_ip}:{service_port} every "
                 f"{avg_gap:.1f}s (jitter {jitter:.0%}, {len(gaps)} intervals)"
             ),
             evidence={
@@ -119,6 +141,10 @@ class BeaconTracker:
                 "jitter_ratio": round(jitter, 4),
                 "interval_count": len(gaps),
                 "avg_bytes_per_window": round(avg_bytes, 1),
+                "peak_bytes_per_window": round(max(self._bytes[key]), 1),
+                # packet-size shape: small uniform payloads back up the timing
+                "avg_packets_per_window": round(mean(self._packets[key]), 2),
+                "avg_packet_size": round(avg_bytes / max(mean(self._packets[key]), 1.0), 1),
             },
         )
 
@@ -128,14 +154,28 @@ class BeaconTracker:
         for key in stale:
             del self._times[key]
             del self._bytes[key]
+            del self._packets[key]
             self._last_alert.pop(key, None)
 
 
 def _key(feat: dict[str, Any]) -> tuple[str, str, int, int]:
-    # source port is deliberately excluded: a beacon opens a new one every time
-    return (
-        str(feat.get("src_ip", "")),
-        str(feat.get("dst_ip", "")),
-        to_int(feat.get("dst_port")),
-        to_int(feat.get("protocol")),
-    )
+    """One key per conversation, whichever direction of it the tap carries.
+
+    Both halves arrive as separate 5-tuples. Keying on them separately
+    double-counts a mirrored link, and keying on the outbound half alone goes
+    blind on a tap that only sees one direction, which is what XDP gives us.
+    Folding both onto the same key handles all three cases.
+
+    The service is the lower port, since clients draw high ephemeral ones, and
+    the ephemeral port itself is excluded because a beacon picks a new one
+    every time it calls home.
+    """
+    src_ip = str(feat.get("src_ip", ""))
+    dst_ip = str(feat.get("dst_ip", ""))
+    src_port = to_int(feat.get("src_port"))
+    dst_port = to_int(feat.get("dst_port"))
+    if dst_port <= src_port:
+        local, remote, service = src_ip, dst_ip, dst_port
+    else:
+        local, remote, service = dst_ip, src_ip, src_port
+    return (local, remote, service, to_int(feat.get("protocol")))

@@ -37,6 +37,7 @@ def main(argv: list[str] | None = None) -> None:
     window = FlowWindow()
     sink = AlertSink(args.alerts_out)
     stats = Throughput(args.stats_every)
+    direction = TapDirection()
 
     source.connect()
     try:
@@ -60,6 +61,9 @@ def main(argv: list[str] | None = None) -> None:
                 )
 
             stats.add(len(batch), len(flows), len(alerts), time.time() - received_at)
+            stats.note_handshakes(features)
+            direction.note(features)
+            direction.maybe_warn()
             stats.maybe_log()
     except KeyboardInterrupt:
         LOG.info("stopping")
@@ -67,6 +71,65 @@ def main(argv: list[str] | None = None) -> None:
         stats.log()
         sink.close()
         source.close()
+
+
+class TapDirection:
+    """Warn once if the tap only ever carries one side of a conversation.
+
+    XDP is a receive-path hook, so pointing it at a host's own NIC shows the
+    replies coming back but never the requests that provoked them. Several
+    detectors then go quiet for a structural reason rather than because the
+    traffic was clean, which is worth saying out loud. A mirrored link or SPAN
+    feed does not have this problem: both directions arrive as ingress there.
+
+    Direction is read off the ports rather than the addresses, so this works on
+    an edge span where both endpoints are public.
+    """
+
+    # enough flows that a quiet start does not trigger the warning
+    min_samples = 200
+    # below this share, one direction is effectively absent rather than rare
+    min_minority_share = 0.05
+
+    def __init__(self) -> None:
+        self.to_server = 0
+        self.to_client = 0
+        self.warned = False
+
+    def note(self, features: list[dict]) -> None:
+        for feat in features:
+            # count conversations, not the windows they span
+            if not feat.get("is_new_flow"):
+                continue
+            src_port = int(feat.get("src_port") or 0)
+            dst_port = int(feat.get("dst_port") or 0)
+            # equal ports means icmp or a peer-to-peer protocol like mdns,
+            # neither of which says anything about direction
+            if src_port == dst_port:
+                continue
+            if dst_port < src_port:
+                self.to_server += 1
+            else:
+                self.to_client += 1
+
+    def maybe_warn(self) -> None:
+        total = self.to_server + self.to_client
+        if self.warned or total < self.min_samples:
+            return
+        if min(self.to_server, self.to_client) / total >= self.min_minority_share:
+            return
+        self.warned = True
+        inbound_only = self.to_client > self.to_server
+        LOG.warning(
+            "tap looks one-directional: %d of %d flows are %s. %s",
+            max(self.to_server, self.to_client),
+            total,
+            "replies inbound" if inbound_only else "requests outbound",
+            "JA3 needs the ClientHello and exfiltration needs outbound volume, "
+            "so neither can be detected from here"
+            if inbound_only
+            else "JA3S and inbound scan detection are unavailable from here",
+        )
 
 
 class Throughput:
@@ -82,6 +145,23 @@ class Throughput:
         self.alerts = 0
         self.busy_secs = 0.0
         self.max_batch_secs = 0.0
+        # handshake sampling health, counted once per flow so long-lived
+        # sessions reappearing every window don't inflate the numbers
+        self.hellos = 0
+        self.hellos_complete = 0
+        self.ja3 = 0
+        self.ja3s = 0
+
+    def note_handshakes(self, features: list[dict]) -> None:
+        for feat in features:
+            if not feat.get("is_new_flow"):
+                continue
+            if not (feat.get("tls_is_client_hello") or feat.get("tls_is_server_hello")):
+                continue
+            self.hellos += 1
+            self.hellos_complete += bool(feat.get("tls_sample_complete"))
+            self.ja3 += bool(feat.get("tls_ja3_hash"))
+            self.ja3s += bool(feat.get("tls_ja3s_hash"))
 
     def add(self, received: int, scored: int, alerts: int, elapsed: float) -> None:
         self.batches += 1
@@ -110,6 +190,13 @@ class Throughput:
             self.flows_in / wall,
             capacity,
             self.max_batch_secs * 1000.0,
+        )
+        LOG.info(
+            "handshakes: %d hellos sampled, %d complete, %d ja3, %d ja3s",
+            self.hellos,
+            self.hellos_complete,
+            self.ja3,
+            self.ja3s,
         )
 
 

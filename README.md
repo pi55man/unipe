@@ -12,9 +12,13 @@ The tap is one-way by design: the exporter only reads, the engine only reads the
 socket, and no component can send anything back toward the monitored network.
 
 ```shell
-sudo cargo run --release -p unipe -- --iface eth0 --interval-ms 250
+cargo build --release -p unipe
+sudo ./target/release/unipe --iface wlan0 --skb   # --skb: wi-fi has no native XDP
 cd unipe-ai && python3 run.py --alerts-out alerts.jsonl
 ```
+
+`sudo ./target/release/unipe --verify` loads the XDP program through the kernel
+verifier and exits, without attaching to any interface.
 
 ## Prerequisites
 

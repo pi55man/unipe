@@ -1,13 +1,10 @@
 """malware signals inside TLS/QUIC sessions, metadata only.
 
-nothing is decrypted here. we work from the cleartext handshake header, the
-port the session runs on, and the packet size / timing shape of the flow.
-
-limitation worth knowing: the ebpf side samples 64 payload bytes, which stops
-inside the ClientHello random. that is enough for the record and handshake
-versions but not for the cipher and extension lists a real JA3/JA4 needs, so
-what we emit is a prefix fingerprint. raising the sample size is the single
-change needed to upgrade this to full JA3.
+nothing is decrypted here, and nothing could be: the exporter only samples the
+cleartext handshake, which is the negotiation that happens before any key
+exists. from it we get a JA3 fingerprint of the client, a JA3S of the server,
+the offered version, and the SNI. the rest comes from the packet-size and
+timing shape of the session.
 """
 
 from __future__ import annotations
@@ -15,8 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from unipe_ai.alerts import ENCRYPTED_MALWARE, alert_from_flow, ratio_confidence
-from unipe_ai.util import to_float, to_int
+from unipe_ai.alerts import ENCRYPTED_MALWARE, alert_from_flow
+from unipe_ai.util import to_int
 
 # ssl3.0, tls1.0, tls1.1 - deprecated, and a common malware tell
 LEGACY_TLS_VERSIONS = {0x0300: "SSL 3.0", 0x0301: "TLS 1.0", 0x0302: "TLS 1.1"}
@@ -26,12 +23,13 @@ EXPECTED_QUIC_PORTS = {443, 80, 8443}
 
 @dataclass(frozen=True)
 class EncryptedConfig:
-    # C2 over TLS keeps packets small and the session long
-    c2_max_avg_packet_size: float = 300.0
-    c2_min_duration_ms: float = 30_000.0
-    c2_max_packets: float = 400.0
-    c2_min_packets: float = 8.0
     alert_nonstandard_port: bool = True
+    # a client that skips SNI is usually talking to a raw IP, which is normal
+    # for infrastructure and abnormal for anything user-facing
+    alert_missing_sni: bool = True
+    # JA3 md5 hashes of known-bad clients. empty by default; fill it from a
+    # public feed such as abuse.ch SSLBL, or from your own malware sandbox.
+    ja3_blocklist: tuple[str, ...] = ()
 
 
 def detect_encrypted(
@@ -43,8 +41,19 @@ def detect_encrypted(
     for feat in features:
         alerts.extend(_tls_alerts(feat, cfg))
         alerts.extend(_quic_alerts(feat, cfg))
-        alerts.extend(_shape_alerts(feat, cfg))
     return alerts
+
+
+def _on_known_service_port(feat: dict[str, Any], expected: set[int]) -> bool:
+    """True if either end is a normal port for this protocol.
+
+    Both directions of a session are separate flows here, so the server->client
+    direction has the service port as its *source*. Looking only at dst_port
+    flags every reply as running on a weird port.
+    """
+    return (
+        to_int(feat.get("dst_port")) in expected or to_int(feat.get("src_port")) in expected
+    )
 
 
 def _tls_alerts(feat: dict[str, Any], cfg: EncryptedConfig) -> list[dict[str, Any]]:
@@ -54,7 +63,29 @@ def _tls_alerts(feat: dict[str, Any], cfg: EncryptedConfig) -> list[dict[str, An
     alerts: list[dict[str, Any]] = []
     dst_port = to_int(feat.get("dst_port"))
     client_version = to_int(feat.get("tls_client_version"))
-    fingerprint = str(feat.get("tls_prefix_fingerprint", ""))
+    ja3_hash = str(feat.get("tls_ja3_hash", ""))
+    sni = str(feat.get("tls_sni", ""))
+    # every TLS alert carries the fingerprint so alerts can be pivoted on it
+    common = {
+        "tls_ja3_hash": ja3_hash,
+        "tls_ja3": feat.get("tls_ja3", ""),
+        "tls_sni": sni,
+        "tls_client_version": hex(client_version),
+        "tls_sample_complete": bool(feat.get("tls_sample_complete")),
+    }
+
+    if ja3_hash and ja3_hash in cfg.ja3_blocklist:
+        alerts.append(
+            alert_from_flow(
+                feat,
+                threat_class=ENCRYPTED_MALWARE,
+                subtype="known_bad_ja3",
+                severity="high",
+                confidence=0.95,
+                message=f"client JA3 {ja3_hash} is on the blocklist",
+                evidence=dict(common, alpn=list(feat.get("tls_alpn", ()))),
+            )
+        )
 
     if client_version in LEGACY_TLS_VERSIONS:
         name = LEGACY_TLS_VERSIONS[client_version]
@@ -66,15 +97,11 @@ def _tls_alerts(feat: dict[str, Any], cfg: EncryptedConfig) -> list[dict[str, An
                 severity="medium",
                 confidence=0.7,
                 message=f"client offered deprecated {name} to {feat.get('dst_ip')}:{dst_port}",
-                evidence={
-                    "tls_client_version": hex(client_version),
-                    "tls_version_name": name,
-                    "tls_prefix_fingerprint": fingerprint,
-                },
+                evidence=dict(common, tls_version_name=name),
             )
         )
 
-    if cfg.alert_nonstandard_port and dst_port not in EXPECTED_TLS_PORTS:
+    if cfg.alert_nonstandard_port and not _on_known_service_port(feat, EXPECTED_TLS_PORTS):
         alerts.append(
             alert_from_flow(
                 feat,
@@ -83,11 +110,20 @@ def _tls_alerts(feat: dict[str, Any], cfg: EncryptedConfig) -> list[dict[str, An
                 severity="low",
                 confidence=0.55,
                 message=f"TLS handshake on unexpected port {dst_port}",
-                evidence={
-                    "dst_port": dst_port,
-                    "tls_client_version": hex(client_version),
-                    "tls_prefix_fingerprint": fingerprint,
-                },
+                evidence=dict(common, dst_port=dst_port),
+            )
+        )
+
+    if cfg.alert_missing_sni and not sni and feat.get("dst_is_public_unicast"):
+        alerts.append(
+            alert_from_flow(
+                feat,
+                threat_class=ENCRYPTED_MALWARE,
+                subtype="tls_without_sni",
+                severity="medium",
+                confidence=0.6,
+                message=f"TLS handshake to public {feat.get('dst_ip')} carried no SNI",
+                evidence=dict(common, ciphers=len(feat.get("tls_ciphers", ()))),
             )
         )
     return alerts
@@ -97,7 +133,7 @@ def _quic_alerts(feat: dict[str, Any], cfg: EncryptedConfig) -> list[dict[str, A
     if not feat.get("quic_is_initial"):
         return []
     dst_port = to_int(feat.get("dst_port"))
-    if not cfg.alert_nonstandard_port or dst_port in EXPECTED_QUIC_PORTS:
+    if not cfg.alert_nonstandard_port or _on_known_service_port(feat, EXPECTED_QUIC_PORTS):
         return []
     return [
         alert_from_flow(
@@ -115,39 +151,9 @@ def _quic_alerts(feat: dict[str, Any], cfg: EncryptedConfig) -> list[dict[str, A
     ]
 
 
-def _shape_alerts(feat: dict[str, Any], cfg: EncryptedConfig) -> list[dict[str, Any]]:
-    """long-lived encrypted session that only ever trickles tiny packets."""
-    if not (feat.get("tls_is_handshake") or feat.get("quic_is_long_header")):
-        return []
-
-    duration_ms = to_float(feat.get("total_duration_ms"), to_float(feat.get("duration_ms")))
-    packets = to_float(feat.get("total_packets"), to_float(feat.get("packets")))
-    avg_size = to_float(feat.get("avg_packet_size"))
-    if duration_ms < cfg.c2_min_duration_ms:
-        return []
-    if not cfg.c2_min_packets <= packets <= cfg.c2_max_packets:
-        return []
-    if avg_size > cfg.c2_max_avg_packet_size:
-        return []
-
-    return [
-        alert_from_flow(
-            feat,
-            threat_class=ENCRYPTED_MALWARE,
-            subtype="encrypted_low_volume_session",
-            severity="medium",
-            confidence=ratio_confidence(
-                cfg.c2_max_avg_packet_size / max(avg_size, 1.0), 1.0, ceiling=4.0
-            ),
-            message=(
-                f"encrypted session held {duration_ms / 1000:.0f}s with only {packets:.0f} "
-                f"packets averaging {avg_size:.0f} bytes"
-            ),
-            evidence={
-                "duration_ms": duration_ms,
-                "packets": packets,
-                "avg_packet_size": round(avg_size, 1),
-                "tls_prefix_fingerprint": feat.get("tls_prefix_fingerprint", ""),
-            },
-        )
-    ]
+# There used to be an "encrypted_low_volume_session" rule here: long-lived TLS
+# session, few packets, small average size. It fired on every idle browser
+# keepalive, because shape on its own does not distinguish C2 from a connection
+# sitting open doing nothing. What actually separates them is *regularity*, so
+# packet-size shape now feeds the beaconing detector as evidence instead of
+# raising an alert by itself.

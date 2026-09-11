@@ -41,7 +41,7 @@ class FlowSocket:
                 return
             batch = json.loads(payload)
             if not isinstance(batch, list):
-                raise ValueError("expected a JSON array of flows")
+                raise TypeError("expected a JSON array of flows")
             yield batch
 
     def close(self) -> None:

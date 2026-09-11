@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 dist/
 build/
+# capture output from a live run
+*.jsonl

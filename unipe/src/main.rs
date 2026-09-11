@@ -23,7 +23,7 @@ use tokio::{
     sync::Mutex,
     time::interval,
 };
-use unipe_common::{FlowKey, FlowRecord};
+use unipe_common::{FlowKey, FlowRecord, HandshakeSample, HANDSHAKE_CAP};
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -34,6 +34,12 @@ struct Opt {
     /// how often flows are published; this is the detection latency budget
     #[clap(long, default_value_t = 250)]
     interval_ms: u64,
+    /// run the eBPF verifier over the program and exit without attaching
+    #[clap(long, default_value_t = false)]
+    verify: bool,
+    /// attach in SKB (generic) mode, for drivers without native XDP such as wi-fi
+    #[clap(long, default_value_t = false)]
+    skb: bool,
 }
 
 #[derive(Serialize)]
@@ -58,7 +64,8 @@ struct FlowExport {
     ttl: u8,
     icmp_type: u8,
     icmp_code: u8,
-    payload_len: u8,
+    /// bytes of DNS/TLS/QUIC handshake metadata sampled; 0 for everything else
+    payload_len: u16,
     payload: String,
 }
 
@@ -103,15 +110,31 @@ async fn main() -> anyhow::Result<()> {
         iface,
         socket,
         interval_ms,
+        verify,
+        skb,
     } = opt;
     let program: &mut Xdp = ebpf.program_mut("xdp_packets").unwrap().try_into()?;
-    program.load()?;
+    // load() is what runs the kernel verifier; attach() only wires it to a NIC
+    program.load().context("eBPF verifier rejected the program")?;
+    if verify {
+        println!("verifier accepted xdp_packets");
+        return Ok(());
+    }
+    let mode = if skb {
+        XdpMode::Skb
+    } else {
+        XdpMode::default()
+    };
     program
-        .attach(&iface, XdpMode::default())
-        .context("failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
+        .attach(&iface, mode)
+        .context("failed to attach the XDP program - most wi-fi drivers have no native XDP, try --skb")?;
 
     let flows: HashMap<_, FlowKey, FlowRecord> =
         HashMap::try_from(ebpf.take_map("FLOWS").context("FLOWS map not found")?)?;
+    let handshakes: HashMap<_, FlowKey, HandshakeSample> = HashMap::try_from(
+        ebpf.take_map("HANDSHAKES")
+            .context("HANDSHAKES map not found")?,
+    )?;
 
     let clients = bind_flow_socket(&socket)?;
     info!(
@@ -131,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             _ = tick.tick() => {
-                match snapshot_flows(&flows, epoch_offset_ns) {
+                match snapshot_flows(&flows, &handshakes, epoch_offset_ns) {
                     Ok(batch) => {
                         if let Err(e) = publish_flows(&clients, &batch).await {
                             warn!("failed to publish flows: {e:#}");
@@ -192,19 +215,33 @@ fn epoch_offset_ns() -> u64 {
 
 fn snapshot_flows(
     flows: &HashMap<aya::maps::MapData, FlowKey, FlowRecord>,
+    handshakes: &HashMap<aya::maps::MapData, FlowKey, HandshakeSample>,
     epoch_offset_ns: u64,
 ) -> anyhow::Result<Vec<FlowExport>> {
     let mut batch = Vec::new();
     for item in flows.iter() {
         let (key, record) = item.context("failed to read flow entry")?;
-        batch.push(export_flow(key, record, epoch_offset_ns));
+        // most flows never have a handshake, so this usually misses
+        let sample = handshakes.get(&key, 0).ok();
+        batch.push(export_flow(key, record, sample, epoch_offset_ns));
     }
     Ok(batch)
 }
 
-fn export_flow(key: FlowKey, record: FlowRecord, epoch_offset_ns: u64) -> FlowExport {
+fn export_flow(
+    key: FlowKey,
+    record: FlowRecord,
+    sample: Option<HandshakeSample>,
+    epoch_offset_ns: u64,
+) -> FlowExport {
     let duration_ns = record.last_time_ns.saturating_sub(record.start_time_ns);
-    let payload_len = record.payload_len.min(64);
+    let (payload_len, payload) = match sample {
+        Some(sample) => {
+            let len = sample.len.min(HANDSHAKE_CAP as u16);
+            (len, hex_bytes(&sample.bytes[..len as usize]))
+        }
+        None => (0, String::new()),
+    };
     FlowExport {
         src_ip: Ipv4Addr::from(key.src_ip).to_string(),
         dst_ip: Ipv4Addr::from(key.dst_ip).to_string(),
@@ -225,7 +262,7 @@ fn export_flow(key: FlowKey, record: FlowRecord, epoch_offset_ns: u64) -> FlowEx
         icmp_type: record.icmp_type,
         icmp_code: record.icmp_code,
         payload_len,
-        payload: hex_bytes(&record.payload[..payload_len as usize]),
+        payload,
     }
 }
 

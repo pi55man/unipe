@@ -56,6 +56,7 @@ class FlowWindow:
 
             windowed = dict(flow)
             windowed.update(delta)
+            windowed["is_new_flow"] = previous is None
             windowed["duration_ms"] = base_ms
             windowed["window_ms"] = elapsed_ms
             windowed["total_packets"] = totals["packets"]

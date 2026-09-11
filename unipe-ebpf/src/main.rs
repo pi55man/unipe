@@ -5,25 +5,43 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{map, xdp},
-    maps::LruHashMap,
+    maps::{LruHashMap, PerCpuArray},
     programs::XdpContext,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
     icmp::Icmpv4Hdr,
-    ip::Ipv4Hdr,
+    ip::{IpProto, Ipv4Hdr},
     tcp::TcpHdr,
     udp::UdpHdr,
 };
-use unipe_common::{FlowKey, FlowRecord};
+use unipe_common::{FlowKey, FlowRecord, HandshakeSample, HANDSHAKE_CAP};
 
 use core::mem;
 
 const FLOW_MAP_SIZE: u32 = 10240;
+/// Only a small share of flows ever carry a handshake, so this map is far
+/// smaller than FLOWS even though each entry is much bigger.
+const HANDSHAKE_MAP_SIZE: u32 = 2048;
+const DNS_PORT: u16 = 53;
+const TLS_HANDSHAKE_RECORD: u8 = 0x16;
+/// First byte of a QUIC Initial: 1 = long header, 1 = fixed bit, 00 = Initial.
+const QUIC_INITIAL_MASK: u8 = 0xF0;
+const QUIC_INITIAL_BITS: u8 = 0xC0;
 
 #[map]
 static FLOWS: LruHashMap<FlowKey, FlowRecord> =
     LruHashMap::with_max_entries(FLOW_MAP_SIZE, 0);
+
+#[map]
+static HANDSHAKES: LruHashMap<FlowKey, HandshakeSample> =
+    LruHashMap::with_max_entries(HANDSHAKE_MAP_SIZE, 0);
+
+/// A HandshakeSample is ~2 KB, which dwarfs the 512-byte eBPF stack, so samples
+/// are assembled here and then copied into HANDSHAKES. One slot per CPU, and
+/// XDP runs to completion without preemption, so there is nothing to race with.
+#[map]
+static SCRATCH: PerCpuArray<HandshakeSample> = PerCpuArray::with_max_entries(1, 0);
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -50,25 +68,54 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     Ok((start + offset) as *const T)
 }
 
-// returns (buf, length_copied).
+/// Copies up to HANDSHAKE_CAP L7 bytes straight into a map value and returns
+/// how many were available. Writing into the map avoids ever holding the sample
+/// on the stack.
 #[inline(always)]
-fn read_payload(ctx: &XdpContext, offset: usize) -> ([u8; 64], u8) {
-    let mut buf = [0u8; 64];
-    let mut len = 0u8;
+fn read_payload_into(ctx: &XdpContext, offset: usize, buf: &mut [u8; HANDSHAKE_CAP]) -> u16 {
     let data = ctx.data();
     let end = ctx.data_end();
 
-    let mut i = 0usize;
-    while i < 64 {
-        let addr = data + offset + i;
+    let mut len = 0usize;
+    while len < HANDSHAKE_CAP {
+        let addr = data + offset + len;
         if addr + 1 > end {
             break;
         }
-        buf[i] = unsafe { *(addr as *const u8) };
-        i += 1;
-        len = i as u8;
+        // the mask is what proves to the verifier that the index is in range
+        buf[len & (HANDSHAKE_CAP - 1)] = unsafe { *(addr as *const u8) };
+        len += 1;
     }
-    (buf, len)
+    len as u16
+}
+
+/// Only DNS messages and TLS/QUIC handshake records are worth sampling, and
+/// they are the only L7 bytes we are willing to copy. Application data, which
+/// is what would carry actual user content, is never touched.
+#[inline(always)]
+fn is_sampleable(
+    ctx: &XdpContext,
+    offset: usize,
+    proto: IpProto,
+    src_port: u16,
+    dst_port: u16,
+) -> bool {
+    if src_port == DNS_PORT || dst_port == DNS_PORT {
+        return true;
+    }
+    let Ok(first) = ptr_at::<u8>(ctx, offset) else {
+        return false;
+    };
+    let byte = unsafe { *first };
+    match proto {
+        IpProto::Tcp => byte == TLS_HANDSHAKE_RECORD,
+        // QUIC Initial: long header bit, the mandatory fixed bit, and packet
+        // type 0. Deliberately not port-gated, because malware hiding QUIC on
+        // an odd port is exactly what we want to catch, and this shape check is
+        // tight enough that ordinary UDP does not trip it.
+        IpProto::Udp => byte & QUIC_INITIAL_MASK == QUIC_INITIAL_BITS,
+        _ => false,
+    }
 }
 
 fn try_xdp_packets(ctx: XdpContext) -> Result<u32, ()> {
@@ -124,7 +171,7 @@ fn try_xdp_packets(ctx: XdpContext) -> Result<u32, ()> {
         _ => return Ok(xdp_action::XDP_PASS),
     };
 
-    let (payload, payload_len) = read_payload(&ctx, l7_offset);
+    let sampleable = is_sampleable(&ctx, l7_offset, proto, src_port, dst_port);
 
     let flow = FlowKey {
         src_ip: source_addr,
@@ -136,7 +183,11 @@ fn try_xdp_packets(ctx: XdpContext) -> Result<u32, ()> {
     };
 
     let now = unsafe { bpf_ktime_get_ns() };
-    let is_dns = if src_port == 53 || dst_port == 53 { 1 } else { 0 };
+    let is_dns = if src_port == DNS_PORT || dst_port == DNS_PORT {
+        1
+    } else {
+        0
+    };
 
     if let Some(record) = FLOWS.get_ptr_mut(&flow) {
         unsafe {
@@ -150,10 +201,6 @@ fn try_xdp_packets(ctx: XdpContext) -> Result<u32, ()> {
             if is_dns == 1 {
                 (*record).is_dns = 1;
             }
-            if (*record).payload_len == 0 && payload_len > 0 {
-                (*record).payload = payload;
-                (*record).payload_len = payload_len;
-            }
         }
     } else {
         let record = FlowRecord {
@@ -165,15 +212,26 @@ fn try_xdp_packets(ctx: XdpContext) -> Result<u32, ()> {
             ack_count: ack,
             fin_count: fin,
             rst_count: rst,
-            payload,
-            payload_len,
             ttl,
             icmp_type,
             icmp_code,
             is_dns,
-            _pad: [0; 3],
+            _pad: [0; 4],
         };
         let _ = FLOWS.insert(&flow, &record, 0);
+    }
+
+    // keep watching until a handshake shows up, then sample it exactly once
+    if sampleable && HANDSHAKES.get_ptr(&flow).is_none() {
+        if let Some(sample) = SCRATCH.get_ptr_mut(0) {
+            unsafe {
+                (*sample).len = read_payload_into(&ctx, l7_offset, &mut (*sample).bytes);
+                (*sample)._pad = [0; 6];
+                if (*sample).len > 0 {
+                    let _ = HANDSHAKES.insert(&flow, &*sample, 0);
+                }
+            }
+        }
     }
 
     Ok(xdp_action::XDP_PASS)

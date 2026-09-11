@@ -1,9 +1,15 @@
+use std::{net::Ipv4Addr, time::Duration};
+
 use anyhow::Context as _;
-use aya::programs::{Xdp, XdpMode};
+use aya::{
+    maps::HashMap,
+    programs::{Xdp, XdpMode},
+};
 use clap::Parser;
 #[rustfmt::skip]
 use log::{debug, warn};
-use tokio::signal;
+use tokio::{signal, time::interval};
+use unipe_common::{FlowKey, FlowRecord};
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -17,8 +23,6 @@ async fn main() -> anyhow::Result<()> {
 
     env_logger::init();
 
-    // Bump the memlock rlimit. This is needed for older kernels that don't use the
-    // new memcg based accounting, see https://lwn.net/Articles/837122/
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -28,10 +32,6 @@ async fn main() -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/unipe"
@@ -54,14 +54,49 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let Opt { iface } = opt;
-    let program: &mut Xdp = ebpf.program_mut("unipe").unwrap().try_into()?;
+    let program: &mut Xdp = ebpf.program_mut("xdp_packets").unwrap().try_into()?;
     program.load()?;
-    program.attach(&iface, XdpMode::default())
+    program
+        .attach(&iface, XdpMode::default())
         .context("failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
 
-    let ctrl_c = signal::ctrl_c();
+    let flows: HashMap<_, FlowKey, FlowRecord> =
+        HashMap::try_from(ebpf.take_map("FLOWS").context("FLOWS map not found")?)?;
+
     println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
-    println!("Exiting...");
+    let mut tick = interval(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                println!("Exiting...");
+                break;
+            }
+            _ = tick.tick() => {
+                for item in flows.iter() {
+                    let (key, record) = item.context("failed to read flow entry")?;
+                    println!(
+                        "{}:{} -> {}:{} proto={} pkts={} bytes={} ttl={} icmp={}/{} dns={} syn={} ack={} fin={} rst={} payload_len={}",
+                        Ipv4Addr::from(key.src_ip),
+                        key.src_port,
+                        Ipv4Addr::from(key.dst_ip),
+                        key.dst_port,
+                        key.protocol,
+                        record.packet_count,
+                        record.byte_count,
+                        record.ttl,
+                        record.icmp_type,
+                        record.icmp_code,
+                        record.is_dns,
+                        record.syn_count,
+                        record.ack_count,
+                        record.fin_count,
+                        record.rst_count,
+                        record.payload_len,
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }

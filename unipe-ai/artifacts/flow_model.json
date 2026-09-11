@@ -1,0 +1,55 @@
+{
+  "model": "logistic_regression",
+  "feature_names": [
+    "log_packet_rate",
+    "log_byte_rate",
+    "log_packets",
+    "log_duration_ms",
+    "avg_packet_size_norm",
+    "syn_only",
+    "syn_ack_ratio_norm",
+    "is_udp",
+    "is_icmp",
+    "src_is_martian"
+  ],
+  "weights": [
+    2.80722315523742,
+    1.6698771502974727,
+    1.5284831297499006,
+    -2.5983500573336915,
+    1.537899079202984,
+    3.2080308949363134,
+    1.078267211011762,
+    0.6530016803678093,
+    2.6300998714638273,
+    2.9795720035889213
+  ],
+  "bias": -2.2478893134940856,
+  "metrics": {
+    "seed": 7,
+    "epochs": 400,
+    "learning_rate": 0.5,
+    "train_samples": 4200,
+    "validation_samples": 1800,
+    "train": {
+      "accuracy": 0.9143,
+      "precision": 0.9665,
+      "recall": 0.8571,
+      "f1": 0.9085,
+      "true_positives": 1788,
+      "false_positives": 62,
+      "true_negatives": 2052,
+      "false_negatives": 298
+    },
+    "validation": {
+      "accuracy": 0.9122,
+      "precision": 0.9785,
+      "recall": 0.8457,
+      "f1": 0.9073,
+      "true_positives": 773,
+      "false_positives": 17,
+      "true_negatives": 869,
+      "false_negatives": 141
+    }
+  }
+}

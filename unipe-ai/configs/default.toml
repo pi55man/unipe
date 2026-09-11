@@ -1,0 +1,73 @@
+socket_path = "/tmp/unipe.sock"
+# the exporter tick, in ms. this is the detection latency budget.
+interval_hint_ms = 250
+
+[volumetric]
+min_unique_sources = 30
+dst_packet_rate = 5000.0
+dst_byte_rate = 2000000.0
+flow_packet_rate = 5000.0
+flow_byte_rate = 2000000.0
+flow_min_duration_ms = 500.0
+flow_min_packets = 100.0
+syn_flood_min_flows = 20
+syn_flood_min_syn_ratio = 5.0
+syn_only_fraction = 0.7
+udp_flood_min_flows = 25
+udp_flood_packet_rate = 5000.0
+udp_flood_max_avg_packets = 3.0
+icmp_flood_min_flows = 25
+icmp_flood_packet_rate = 1000.0
+# Only mutes the generic fan-in alert on RFC1918/multicast destinations.
+# SYN/UDP/ICMP flood signatures always run.
+alert_lan_destinations = false
+
+[spoofing]
+ttl_variance_min_values = 3
+ttl_min_families = 3
+spoofed_syn_min_sources = 20
+spoofed_syn_min_flows = 20
+spoofed_syn_only_fraction = 0.8
+# Keep false on laptop/Wi-Fi taps. Set true only on edge/ISP unidirectional spans.
+alert_private_to_public = false
+
+[beaconing]
+min_intervals = 4
+max_jitter_ratio = 0.20
+min_interval_s = 1.0
+max_interval_s = 3600.0
+max_avg_bytes_per_window = 8192.0
+history = 24
+alert_cooldown_s = 300.0
+idle_evict_s = 7200.0
+
+[dns]
+dga_min_entropy = 3.6
+dga_min_label_len = 10
+dga_max_label_len = 32
+tunnel_min_qname_len = 45
+tunnel_min_label_count = 4
+tunnel_min_entropy = 3.2
+tunnel_min_subdomains = 15
+max_reasonable_qname_len = 50
+
+[encrypted]
+c2_max_avg_packet_size = 300.0
+c2_min_duration_ms = 30000.0
+c2_max_packets = 400.0
+c2_min_packets = 8.0
+alert_nonstandard_port = true
+
+[scanning]
+min_ports_per_dst = 20
+min_dsts_per_port = 20
+max_avg_packets = 5.0
+min_syn_only_fraction = 0.7
+
+[exfiltration]
+min_outbound_bytes = 5000000.0
+min_ratio = 10.0
+min_duration_ms = 1000.0
+require_internal_source = true
+# An unseen reverse direction is normal on a one-way span, so don't infer from it.
+require_reverse_flow = true

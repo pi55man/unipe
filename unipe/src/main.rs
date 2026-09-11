@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context as _;
@@ -31,8 +31,9 @@ struct Opt {
     iface: String,
     #[clap(long, default_value = "/tmp/unipe.sock")]
     socket: PathBuf,
-    #[clap(long, default_value_t = 2)]
-    interval_secs: u64,
+    /// how often flows are published; this is the detection latency budget
+    #[clap(long, default_value_t = 250)]
+    interval_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -50,7 +51,10 @@ struct FlowExport {
     fin_count: u32,
     rst_count: u32,
     is_dns: bool,
+    /// unix seconds of the last packet seen on this flow
     timestamp: f64,
+    /// unix seconds of the first packet seen on this flow
+    first_seen: f64,
     ttl: u8,
     icmp_type: u8,
     icmp_code: u8,
@@ -98,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     let Opt {
         iface,
         socket,
-        interval_secs,
+        interval_ms,
     } = opt;
     let program: &mut Xdp = ebpf.program_mut("xdp_packets").unwrap().try_into()?;
     program.load()?;
@@ -115,8 +119,11 @@ async fn main() -> anyhow::Result<()> {
         socket.display()
     );
 
+    // the ebpf map stores monotonic clock values; this shifts them onto unix time
+    let epoch_offset_ns = epoch_offset_ns();
+
     println!("Waiting for Ctrl-C...");
-    let mut tick = interval(Duration::from_secs(interval_secs.max(1)));
+    let mut tick = interval(Duration::from_millis(interval_ms.max(10)));
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => {
@@ -124,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             _ = tick.tick() => {
-                match snapshot_flows(&flows) {
+                match snapshot_flows(&flows, epoch_offset_ns) {
                     Ok(batch) => {
                         if let Err(e) = publish_flows(&clients, &batch).await {
                             warn!("failed to publish flows: {e:#}");
@@ -165,18 +172,37 @@ fn bind_flow_socket(path: &Path) -> anyhow::Result<Clients> {
     Ok(clients)
 }
 
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // bpf_ktime_get_ns reads the same clock, so this lines the two up
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+fn epoch_offset_ns() -> u64 {
+    let unix_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    unix_ns.saturating_sub(monotonic_ns())
+}
+
 fn snapshot_flows(
     flows: &HashMap<aya::maps::MapData, FlowKey, FlowRecord>,
+    epoch_offset_ns: u64,
 ) -> anyhow::Result<Vec<FlowExport>> {
     let mut batch = Vec::new();
     for item in flows.iter() {
         let (key, record) = item.context("failed to read flow entry")?;
-        batch.push(export_flow(key, record));
+        batch.push(export_flow(key, record, epoch_offset_ns));
     }
     Ok(batch)
 }
 
-fn export_flow(key: FlowKey, record: FlowRecord) -> FlowExport {
+fn export_flow(key: FlowKey, record: FlowRecord, epoch_offset_ns: u64) -> FlowExport {
     let duration_ns = record.last_time_ns.saturating_sub(record.start_time_ns);
     let payload_len = record.payload_len.min(64);
     FlowExport {
@@ -193,7 +219,8 @@ fn export_flow(key: FlowKey, record: FlowRecord) -> FlowExport {
         fin_count: record.fin_count,
         rst_count: record.rst_count,
         is_dns: record.is_dns == 1,
-        timestamp: record.last_time_ns as f64 / 1_000_000_000.0,
+        timestamp: (record.last_time_ns + epoch_offset_ns) as f64 / 1_000_000_000.0,
+        first_seen: (record.start_time_ns + epoch_offset_ns) as f64 / 1_000_000_000.0,
         ttl: record.ttl,
         icmp_type: record.icmp_type,
         icmp_code: record.icmp_code,

@@ -1,5 +1,21 @@
 # unipe
 
+AI-based detection of cyber threats in unidirectional IP traffic.
+
+- `unipe-ebpf` — XDP program that counts flows in an LRU map.
+- `unipe` — userspace exporter; snapshots the map and publishes flow records
+  over a Unix socket.
+- `unipe-ai` — Python detection engine. See [unipe-ai/README.md](unipe-ai/README.md)
+  for the models, features, training/validation, throughput and alert schema.
+
+The tap is one-way by design: the exporter only reads, the engine only reads the
+socket, and no component can send anything back toward the monitored network.
+
+```shell
+sudo cargo run --release -p unipe -- --iface eth0 --interval-ms 250
+cd unipe-ai && python3 run.py --alerts-out alerts.jsonl
+```
+
 ## Prerequisites
 
 1. stable rust toolchains: `rustup toolchain install stable`

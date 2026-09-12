@@ -20,7 +20,7 @@ VOLUMETRIC_DDOS = "volumetric_ddos"
 IP_SPOOFING = "ip_spoofing"
 C2_BEACONING = "c2_beaconing"
 DNS_ABUSE = "dns_abuse"
-ENCRYPTED_MALWARE = "encrypted_malware"
+ENCRYPTED_ANOMALY = "encrypted_anomaly"
 RECON_SCANNING = "recon_scanning"
 DATA_EXFILTRATION = "data_exfiltration"
 

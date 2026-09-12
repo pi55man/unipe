@@ -10,13 +10,12 @@ only output is an alert record.
 ## Running it
 
 ```shell
-# live, against the exporter. add --skb on wi-fi and other drivers
-# that have no native XDP support
+# live against the exporter; alerts/status default under /tmp/unipe/ for the ui
 sudo ./target/release/unipe --iface eth0 --interval-ms 250
-python3 run.py --alerts-out alerts.jsonl
+python3 run.py
 
 # replay a recorded capture, no root needed
-python3 run.py --replay capture.jsonl --alerts-out alerts.jsonl
+python3 run.py --replay capture.jsonl --replay-tick 0.25
 
 # retrain the scoring model, then measure throughput
 python3 train.py
@@ -24,8 +23,8 @@ python3 bench.py
 ```
 
 A replay file is one JSON array of flows per line, i.e. one exporter tick per
-line. Alerts are appended to `--alerts-out` as JSON lines, which is what a
-separate frontend is expected to read.
+line. By default alerts append to `/tmp/unipe/alerts.jsonl` and a live
+`/tmp/unipe/status.json` is written for the Tauri desktop console.
 
 ## Pipeline
 
@@ -56,8 +55,8 @@ trained model that adjusts the confidence of whatever the rules found.
 | `volumetric_ddos` | `models/volumetric.py` | fan-in rate per victim, SYN/UDP/ICMP flood signatures, per-flow rate extremes |
 | `ip_spoofing` | `models/spoofing.py` | martian sources, TTL spread across initial-TTL families, SYN storms with zero ACKs, LAND |
 | `c2_beaconing` | `models/beaconing.py` | stddev/mean of the gaps between activity per conversation, both directions folded onto one key |
-| `dns_abuse` | `models/dnsabuse.py` | bigram improbability, normalised entropy, vowel and digit ratio of the longest label (DGA), long stuffed names, TXT/NULL records, subdomain volume per parent (tunnelling) |
-| `encrypted_malware` | `models/encrypted.py` | JA3/JA3S fingerprints, blocklisted JA3, deprecated TLS versions, handshakes on odd ports, missing SNI to a public IP |
+| `dns_abuse` | `models/dnsabuse.py` | trained DNS logistic on label stats (DGA); long stuffed names / TXT / subdomain volume (tunnelling) |
+| `encrypted_anomaly` | `models/encrypted.py` | JA3/JA3S fingerprints, blocklisted JA3 (known-bad), deprecated TLS versions, handshakes on odd ports, missing SNI to a public IP |
 | `recon_scanning` | `models/scanning.py` | port fan-out per target, host fan-out per port, with probe-sized flows |
 | `data_exfiltration` | `models/exfiltration.py` | outbound/inbound byte ratio, pairing each flow with its reverse 5-tuple |
 
@@ -211,31 +210,61 @@ rising toward 0.95 at three times the threshold.
 
 ### Training and validation
 
-There is no public capture that matches a one-way tap of this exporter's exact
-field set, so `train.py` generates a labelled set from the traffic profiles the
-detectors target — benign (browsing, streaming, DNS, mDNS, short idle sessions)
-against malicious (SYN flood, UDP flood, ICMP flood, port scan, bulk exfil,
-spoofed sources). Every sample goes through the same `extract()` the live
-pipeline uses, so training and inference cannot drift apart.
+The brief asks for synthetic / lab traffic (iperf3, hping3, dnscat2/iodine,
+published DGA algorithms, sandboxed C2 timing). There is no public capture that
+matches this exporter's exact field set, so `train.py` generates **lab-faithful
+synthetic flows named after those tools**. Every sample goes through the same
+`extract()` the live pipeline uses.
 
-6000 samples, shuffled, split 70/30 into train and validation. Batch gradient
-descent on log-loss, 400 epochs, learning rate 0.5, L2 0.001.
-
-Held-out validation (seed 7):
-
-| metric | train | validation |
+| Lab tool (brief) | Profile in `unipe_ai/data/` | What it trains |
 | --- | --- | --- |
-| accuracy | 0.914 | 0.912 |
-| precision | 0.967 | 0.979 |
-| recall | 0.857 | 0.846 |
-| F1 | 0.909 | 0.907 |
+| iperf3 / Ostinato / TRex | `iperf3`, browsing, streaming | flow model negatives |
+| hping3 SYN/UDP | `hping3_syn`, `hping3_udp` | flow model positives |
+| port scan | `port_scan` | flow model positives |
+| dnscat2 / iodine | `dnscat2`, `iodine` | DNS tunnel *rules* (shape) |
+| DGArchive / published algos | `dga_conficker`, `cryptolocker`, … | **DNS logistic model** |
+| sandboxed C2 emulator | `beacon_intervals()` | beaconing hold-out eval |
 
-Train and validation scores sitting on top of each other is the point: a linear
-model on ten features is not able to memorise the set. The bias toward
-precision over recall is intentional — the rules are what catch threats, and a
-model that cried wolf would only inflate confidence on false positives.
+Two models are written:
 
-Retrain with `python3 train.py`. Metrics are stored inside the model file.
+- `artifacts/flow_model.json` — volumetric / scan / spoof / exfil shape
+- `artifacts/dns_model.json` — DGA vs benign query names
+- `artifacts/dataset_manifest.json` — tool map + held-out metrics
+
+DNS tunnelling stays rule-based (length / labels / TXT); DGA uses the trained
+DNS model when the artifact is present, with the old 3-of-4 signal vote as
+fallback. Slowloris is skipped: it needs HTTP semantics this metadata path
+does not parse.
+
+Held-out validation (seed 7, after `python3 train.py`):
+
+**Flow model** (~6000 samples, 70/30 split)
+
+| metric | validation |
+| --- | --- |
+| accuracy | ~0.82 |
+| precision | ~0.94 |
+| recall | ~0.70 |
+| F1 | ~0.80 |
+
+Precision over recall is intentional: iperf3-shaped benign load is in the
+negative class on purpose, so the model does not treat every high-rate flow as
+an attack. The rules still catch floods; the model only *confirms*.
+
+**DNS model** (~8000 names)
+
+| metric | validation |
+| --- | --- |
+| accuracy | ~0.88 |
+| precision | ~0.88 |
+| recall | ~0.89 |
+| F1 | ~0.88 |
+
+**Beaconing** (200 synthetic C2 vs browsing timing trials): accuracy 1.0 on the
+hold-out generator (real lab captures would replace this section later).
+
+Retrain with `python3 train.py`. Metrics live inside each model file and in
+the manifest.
 
 ## Throughput
 
@@ -372,6 +401,10 @@ positives, and each one pointed at a specific modelling mistake:
   volume gate looks at the busiest window rather than the average: a beacon is
   small every single time, whereas a browser keepalive is small only because
   the page it belongs to already finished loading.
+- **BitTorrent looks like C2 until you count peers.** A swarm wakes many
+  remotes on the same ~30s schedule (often on 6881–6989). That is suppressed
+  by ignoring common P2P ports and dropping any local host that has ≥3 peers
+  on a near-identical period. Lone implants still alert.
 - **Numeric labels are not DGA.** An all-digit label such as a Discord
   snowflake has no vowels and no letter pairs for the trivial reason that it
   has no letters, which tripped three of the four randomness signals at once.

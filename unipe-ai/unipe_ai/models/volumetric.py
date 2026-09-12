@@ -90,10 +90,13 @@ def _dst_alerts(
     udp_sources = {str(f.get("src_ip", "")) for f in udp_flows if f.get("src_ip")}
 
     lan_victim = bool(flows) and all(
-        f.get("dst_is_private") or f.get("dst_is_multicast") for f in flows
+        f.get("dst_is_private")
+        or f.get("dst_is_multicast")
+        or f.get("dst_is_loopback")
+        for f in flows
     )
-    # Only the generic fan-in alert is muted for LAN destinations. SYN/UDP/ICMP
-    # flood signatures are specific enough to trust anywhere.
+    # Only the generic fan-in alert is muted for LAN/loopback destinations.
+    # SYN/UDP/ICMP flood signatures are specific enough to trust anywhere.
     mute_generic = lan_victim and not cfg.alert_lan_destinations
 
     syn_total = sum(to_float(f.get("syn_count")) for f in tcp_flows)
@@ -101,32 +104,8 @@ def _dst_alerts(
     syn_only = sum(1 for f in tcp_flows if f.get("is_syn_only"))
     syn_only_frac = syn_only / max(len(tcp_flows), 1)
 
-    fan_in = len(sources) >= cfg.min_unique_sources and (
-        packet_rate >= cfg.dst_packet_rate or byte_rate >= cfg.dst_byte_rate
-    )
-    if fan_in and not mute_generic:
-        alerts.append(
-            _dst_alert(
-                subtype="fan_in_flood",
-                severity="high",
-                confidence=max(
-                    ratio_confidence(packet_rate, cfg.dst_packet_rate),
-                    ratio_confidence(byte_rate, cfg.dst_byte_rate),
-                ),
-                dst_ip=dst,
-                timestamp=stamp,
-                message=f"volumetric fan-in toward {dst}: {len(sources)} sources, "
-                f"{packet_rate:.0f} pps / {byte_rate:.0f} Bps",
-                evidence={
-                    "unique_sources": len(sources),
-                    "flow_count": len(flows),
-                    "packet_rate": packet_rate,
-                    "byte_rate": byte_rate,
-                    "packets": total_packets,
-                    "bytes": total_bytes,
-                },
-            )
-        )
+    # Prefer specific protocol floods; fan-in is the catch-all when none apply.
+    specific = False
 
     syn_ratio = syn_total / max(ack_total, 1.0)
     if (
@@ -134,6 +113,7 @@ def _dst_alerts(
         and syn_ratio >= cfg.syn_flood_min_syn_ratio
         and syn_only_frac >= cfg.syn_only_fraction
     ):
+        specific = True
         severity = "high" if len(sources) >= cfg.min_unique_sources else "medium"
         alerts.append(
             _dst_alert(
@@ -167,7 +147,13 @@ def _dst_alerts(
         and len(udp_sources) >= cfg.min_unique_sources
         and udp_rate >= cfg.udp_flood_packet_rate
     )
+    # On a laptop NIC, BitTorrent/P2P toward your RFC1918 address is high-pps
+    # with real sessions — only trust the classic 1-packet spoofed signature
+    # there. High-rate floods still fire toward public victims.
+    if mute_generic:
+        high_rate_udp = False
     if spoofed_udp or high_rate_udp:
+        specific = True
         alerts.append(
             _dst_alert(
                 subtype="udp_flood",
@@ -194,6 +180,7 @@ def _dst_alerts(
 
     icmp_rate = sum(to_float(f.get("packet_rate")) for f in icmp_flows)
     if len(icmp_flows) >= cfg.icmp_flood_min_flows and icmp_rate >= cfg.icmp_flood_packet_rate:
+        specific = True
         alerts.append(
             _dst_alert(
                 subtype="icmp_flood",
@@ -208,6 +195,33 @@ def _dst_alerts(
                     "unique_sources": len(sources),
                     "icmp_flows": len(icmp_flows),
                     "packet_rate": icmp_rate,
+                },
+            )
+        )
+
+    fan_in = len(sources) >= cfg.min_unique_sources and (
+        packet_rate >= cfg.dst_packet_rate or byte_rate >= cfg.dst_byte_rate
+    )
+    if fan_in and not mute_generic and not specific:
+        alerts.append(
+            _dst_alert(
+                subtype="fan_in_flood",
+                severity="high",
+                confidence=max(
+                    ratio_confidence(packet_rate, cfg.dst_packet_rate),
+                    ratio_confidence(byte_rate, cfg.dst_byte_rate),
+                ),
+                dst_ip=dst,
+                timestamp=stamp,
+                message=f"volumetric fan-in toward {dst}: {len(sources)} sources, "
+                f"{packet_rate:.0f} pps / {byte_rate:.0f} Bps",
+                evidence={
+                    "unique_sources": len(sources),
+                    "flow_count": len(flows),
+                    "packet_rate": packet_rate,
+                    "byte_rate": byte_rate,
+                    "packets": total_packets,
+                    "bytes": total_bytes,
                 },
             )
         )

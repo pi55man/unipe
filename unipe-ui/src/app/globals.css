@@ -1,0 +1,110 @@
+@import "tailwindcss";
+
+:root,
+[data-theme="light"] {
+  --background: #f4f6f8;
+  --background-wash: #eef1f4;
+  --foreground: #1a1f24;
+  --muted: #5c6670;
+  --panel: #ffffff;
+  --line: #d7dde3;
+  --accent: #0f6e56;
+  --accent-soft: #d8ebe4;
+
+  --sev-high: #b42318;
+  --sev-med: #b54708;
+  --sev-low: #667085;
+
+  --threat-volumetric: #0f6e56;
+  --threat-spoofing: #475467;
+  --threat-beaconing: #9e3d1c;
+  --threat-dns: #3d4f6f;
+  --threat-encrypted: #5b4b6e;
+  --threat-scanning: #5f6b3a;
+  --threat-exfil: #8a4b2e;
+
+  --grain-opacity: 0.035;
+}
+
+[data-theme="dark"] {
+  --background: #14181e;
+  --background-wash: #0f1217;
+  --foreground: #e6e9ed;
+  --muted: #8b949e;
+  --panel: #1b2129;
+  --line: #2c343e;
+  --accent: #3d9b7a;
+  --accent-soft: #1a3029;
+
+  --sev-high: #f97066;
+  --sev-med: #fdb022;
+  --sev-low: #8b949e;
+
+  --threat-volumetric: #3d9b7a;
+  --threat-spoofing: #9aa3ad;
+  --threat-beaconing: #e07a4d;
+  --threat-dns: #7d8fb0;
+  --threat-encrypted: #9a86b5;
+  --threat-scanning: #9aaa6a;
+  --threat-exfil: #c48a6a;
+
+  --grain-opacity: 0.06;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-background-wash: var(--background-wash);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-panel: var(--panel);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-sev-high: var(--sev-high);
+  --color-sev-med: var(--sev-med);
+  --color-sev-low: var(--sev-low);
+  --color-threat-volumetric: var(--threat-volumetric);
+  --color-threat-spoofing: var(--threat-spoofing);
+  --color-threat-beaconing: var(--threat-beaconing);
+  --color-threat-dns: var(--threat-dns);
+  --color-threat-encrypted: var(--threat-encrypted);
+  --color-threat-scanning: var(--threat-scanning);
+  --color-threat-exfil: var(--threat-exfil);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: linear-gradient(180deg, var(--background-wash) 0%, var(--background) 42%);
+  background-attachment: fixed;
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+}
+
+body::before {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  opacity: var(--grain-opacity);
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  z-index: 0;
+}
+
+#__next,
+body > * {
+  position: relative;
+  z-index: 1;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

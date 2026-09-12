@@ -1,0 +1,55 @@
+{
+  "model": "logistic_regression",
+  "feature_names": [
+    "label_len_norm",
+    "bigram_familiarity",
+    "normalized_entropy",
+    "raw_entropy_norm",
+    "vowel_ratio",
+    "consonant_ratio",
+    "digit_ratio",
+    "unique_char_ratio",
+    "letter_fraction"
+  ],
+  "weights": [
+    1.7731907702702039,
+    -3.3464749363350372,
+    -0.7727172954685136,
+    1.7487810595057507,
+    0.6749280602371059,
+    2.51455764121531,
+    -1.5423716282616373,
+    -1.542457796607766,
+    1.2591641418437307
+  ],
+  "bias": -0.5662218370353036,
+  "metrics": {
+    "epochs": 400,
+    "learning_rate": 0.5,
+    "train_samples": 5600,
+    "validation_samples": 2400,
+    "train": {
+      "accuracy": 0.882,
+      "precision": 0.8697,
+      "recall": 0.8969,
+      "f1": 0.8831,
+      "true_positives": 2496,
+      "false_positives": 374,
+      "true_negatives": 2443,
+      "false_negatives": 287
+    },
+    "validation": {
+      "accuracy": 0.8808,
+      "precision": 0.8763,
+      "recall": 0.8907,
+      "f1": 0.8835,
+      "true_positives": 1084,
+      "false_positives": 153,
+      "true_negatives": 1030,
+      "false_negatives": 133
+    },
+    "seed": 7,
+    "positive_class": "published-algorithm DGA families",
+    "negative_class": "benign brand/service/cdn-shaped names"
+  }
+}

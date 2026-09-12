@@ -1,0 +1,4 @@
+# Override the workspace-root sudo runner. `env` just execs the binary as the
+# current user — the desktop shell must never ask for root.
+[target.'cfg(all())']
+runner = ["env"]

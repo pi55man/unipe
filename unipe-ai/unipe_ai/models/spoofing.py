@@ -138,8 +138,8 @@ def _ttl_inconsistency_alerts(
     for src, ttls in ttl_by_src.items():
         if len(ttls) < cfg.ttl_variance_min_values:
             continue
-        families = {_ttl_family(t) for t in ttls}
-        # None = TTL that doesn't look like a hop-decremented 32/64/128/255.
+        families = {fam for t in ttls if (fam := _ttl_family(t)) is not None}
+        # unmapped TTLs (None) must not inflate the family count
         family_count = len(families)
         if family_count < cfg.ttl_min_families:
             continue
@@ -159,7 +159,7 @@ def _ttl_inconsistency_alerts(
                 ),
                 evidence={
                     "ttls": sorted(ttls),
-                    "families": sorted(f for f in families if f is not None),
+                    "families": sorted(families),
                     "unmapped": sorted(t for t in ttls if _ttl_family(t) is None),
                     "flow_count": len(samples[src]),
                     "dst_count": len(dsts),
@@ -219,6 +219,10 @@ def _spoofed_syn_storm_alerts(
     return alerts
 
 
+# DHCP / broadcast placeholders — noisy on every LAN, not useful as spoofing
+_DHCP_NOISE_SRCS = frozenset({"0.0.0.0", "255.255.255.255"})
+
+
 def _martian_source_storm_alerts(
     features: list[dict[str, Any]],
     cfg: SpoofingConfig,
@@ -229,6 +233,9 @@ def _martian_source_storm_alerts(
         if not feat.get("src_is_martian"):
             continue
         if feat.get("src_is_loopback") or feat.get("dst_is_loopback"):
+            continue
+        src = str(feat.get("src_ip", ""))
+        if src in _DHCP_NOISE_SRCS:
             continue
         dst = str(feat.get("dst_ip", ""))
         by_dst[dst].append(feat)

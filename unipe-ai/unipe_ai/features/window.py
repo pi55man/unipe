@@ -19,9 +19,15 @@ COUNTER_FIELDS = ("packets", "bytes", "syn_count", "ack_count", "fin_count", "rs
 
 
 class FlowWindow:
-    def __init__(self, idle_evict_secs: float = 120.0, min_window_ms: float = 1.0) -> None:
+    def __init__(
+        self,
+        idle_evict_secs: float = 60.0,
+        min_window_ms: float = 1.0,
+        max_tracked: int = 80_000,
+    ) -> None:
         self.idle_evict_secs = idle_evict_secs
         self.min_window_ms = min_window_ms
+        self.max_tracked = max_tracked
         self._seen: dict[str, dict[str, float]] = {}
         self._last_tick: float | None = None
 
@@ -39,12 +45,14 @@ class FlowWindow:
             previous = self._seen.get(key)
             self._seen[key] = {**totals, "last_seen": now}
 
+            recycled = False
             if previous is None:
                 # first sighting: the totals cover the flow's whole life so far
                 delta = totals
                 base_ms = max(to_float(flow.get("duration_ms")), elapsed_ms, self.min_window_ms)
             elif totals["packets"] < previous["packets"]:
                 # the lru map recycled this 5-tuple, so treat it as brand new
+                recycled = True
                 delta = totals
                 base_ms = max(elapsed_ms, self.min_window_ms)
             else:
@@ -56,7 +64,7 @@ class FlowWindow:
 
             windowed = dict(flow)
             windowed.update(delta)
-            windowed["is_new_flow"] = previous is None
+            windowed["is_new_flow"] = previous is None or recycled
             windowed["duration_ms"] = base_ms
             windowed["window_ms"] = elapsed_ms
             windowed["total_packets"] = totals["packets"]
@@ -71,4 +79,12 @@ class FlowWindow:
         cutoff = now - self.idle_evict_secs
         stale = [key for key, state in self._seen.items() if state["last_seen"] < cutoff]
         for key in stale:
+            del self._seen[key]
+        # under flood the map fills with unique spoofed tuples; drop oldest so
+        # python does not spend seconds walking a multi-million-key dict
+        overflow = len(self._seen) - self.max_tracked
+        if overflow <= 0:
+            return
+        oldest = sorted(self._seen.items(), key=lambda kv: kv[1]["last_seen"])[:overflow]
+        for key, _ in oldest:
             del self._seen[key]

@@ -5,6 +5,9 @@ members = [
     "unipe-common",
     "unipe-ebpf",
 ]
+# tauri has its own Cargo.toml under unipe-ui/src-tauri — keep it out of the
+# eBPF workspace so editions, linkers and the sudo runner stay separate.
+exclude = ["unipe-ui/src-tauri"]
 default-members = ["unipe", "unipe-common"]
 
 [workspace.package]

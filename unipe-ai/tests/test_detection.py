@@ -86,13 +86,18 @@ def test_volumetric_syn_flood():
 def test_spoofing_martian_and_land():
     alerts = detect_spoofing(
         [
-            _flow(src_ip="0.0.0.0", dst_ip="8.8.8.8"),
+            _flow(src_ip="169.254.3.9", dst_ip="8.8.8.8"),
             _flow(src_ip="8.8.8.8", dst_ip="8.8.8.8"),
         ]
     )
     subtypes = {a["subtype"] for a in alerts}
     assert "martian_source" in subtypes
     assert "land_attack" in subtypes
+
+
+def test_dhcp_zero_source_is_not_martian_spam():
+    alerts = detect_spoofing([_flow(src_ip="0.0.0.0", dst_ip="255.255.255.255", protocol=17)])
+    assert not any(a["subtype"].startswith("martian") for a in alerts)
 
 
 def test_spoofing_ttl_inconsistency():
@@ -256,9 +261,43 @@ def test_detector_pipeline():
     detector = Detector(config_path=None)
     detector.volumetric_cfg = VolumetricConfig(flow_packet_rate=50.0, flow_byte_rate=1e12)
     detector.spoofing_cfg = SpoofingConfig()
-    alerts = detector.score([_flow(src_ip="0.0.0.0", packets=500, duration_ms=1000)])
+    alerts = detector.score([_flow(src_ip="169.254.3.9", packets=500, duration_ms=1000)])
     types = {a["threat_class"] for a in alerts}
     assert "ip_spoofing" in types
+
+
+def test_ongoing_udp_flood_is_not_re_alerted_every_tick():
+    """Exporter ticks ~4×/s; one flood must not become hundreds of identical rows."""
+    detector = Detector(config_path=None)
+    detector.volumetric_cfg = VolumetricConfig(
+        udp_flood_min_flows=25,
+        min_unique_sources=10,
+        udp_flood_packet_rate=1000.0,
+        alert_lan_destinations=True,
+    )
+    flows = [
+        _flow(
+            src_ip=f"203.0.113.{i}",
+            dst_ip="198.51.100.10",
+            src_port=12345,
+            dst_port=80,
+            protocol=17,
+            packets=1,
+            bytes=60,
+            duration_ms=50,
+        )
+        for i in range(40)
+    ]
+    first = [a for a in detector.score(flows, now=1000.0) if a["subtype"] == "udp_flood"]
+    second = [a for a in detector.score(flows, now=1000.5) if a["subtype"] == "udp_flood"]
+    third = [a for a in detector.score(flows, now=1061.0) if a["subtype"] == "udp_flood"]
+    assert first
+    assert first[0].get("incident_id")
+    assert not second
+    assert third
+    assert "continuation" in (third[0].get("escalation_reasons") or []) or third[0][
+        "occurrence_count"
+    ] >= 2
 
 
 # --- alert schema ---------------------------------------------------------
@@ -318,7 +357,8 @@ def test_stale_flow_does_not_hide_a_flood():
         duration_ms=3_600_000,
     )
     subtypes = {a["subtype"] for a in detect_volumetric(flood + [stale])}
-    assert "fan_in_flood" in subtypes
+    assert "udp_flood" in subtypes
+    assert "fan_in_flood" not in subtypes  # specific protocol flood wins
 
 
 def test_syn_flood_to_lan_victim_still_alerts():
@@ -388,6 +428,7 @@ def test_window_handles_recycled_map_entry():
     window.deltas([_raw(packets=100)], now=1000.0)
     again = window.deltas([_raw(packets=5)], now=1001.0)
     assert again and again[0]["packets"] == 5
+    assert again[0]["is_new_flow"] is True
 
 
 # --- new threat classes ---------------------------------------------------
@@ -405,9 +446,32 @@ def test_beaconing_detects_regular_checkins():
     )
     alerts = []
     for i in range(6):
-        alerts = tracker.update([beacon], now=1000.0 + i * 60.0)
+        t = 1000.0 + i * 60.0
+        alerts = tracker.update([{**beacon, "timestamp": t}], now=t)
     assert any(a["subtype"] == "periodic_beacon" for a in alerts)
     assert alerts[0]["threat_class"] == "c2_beaconing"
+
+
+def test_beaconing_uses_flow_timestamp_not_wall_clock():
+    """Periodicity must come from feat timestamps; wall clock is cooldown only."""
+    tracker = BeaconTracker(BeaconingConfig(min_intervals=4, alert_cooldown_s=0.0))
+    beacon = _flow(
+        src_ip="192.168.1.50",
+        dst_ip="185.220.101.7",
+        dst_port=8080,
+        packets=4,
+        bytes=800,
+        duration_ms=200,
+    )
+    # irregular wall-clock gaps would fail if activity used `now`
+    walls = (1000.0, 1003.0, 1041.0, 1047.0, 1190.0, 1201.0)
+    alerts = []
+    for i, wall in enumerate(walls):
+        alerts = tracker.update(
+            [{**beacon, "timestamp": 1000.0 + i * 60.0}],
+            now=wall,
+        )
+    assert any(a["subtype"] == "periodic_beacon" for a in alerts)
 
 
 def test_beaconing_ignores_irregular_traffic():
@@ -415,7 +479,8 @@ def test_beaconing_ignores_irregular_traffic():
     browsing = _flow(src_ip="192.168.1.50", dst_ip="104.18.2.3", dst_port=443, packets=4)
     alerts = []
     for gap in (0.0, 3.0, 41.0, 47.0, 190.0, 201.0, 640.0):
-        alerts = tracker.update([browsing], now=1000.0 + gap)
+        t = 1000.0 + gap
+        alerts = tracker.update([{**browsing, "timestamp": t}], now=t)
     assert not alerts
 
 
@@ -436,7 +501,8 @@ def test_beaconing_works_from_the_inbound_direction_alone():
     )
     alerts = []
     for i in range(6):
-        alerts = tracker.update([inbound], now=1000.0 + i * 15.0)
+        t = 1000.0 + i * 15.0
+        alerts = tracker.update([{**inbound, "timestamp": t}], now=t)
     assert len(alerts) == 1
     assert alerts[0]["src_ip"] == "192.168.1.35"
     assert alerts[0]["dst_ip"] == "185.220.101.7"
@@ -456,7 +522,11 @@ def test_beaconing_counts_a_mirrored_conversation_once():
     )
     alerts = []
     for i in range(6):
-        alerts = tracker.update([out, back], now=1000.0 + i * 15.0)
+        t = 1000.0 + i * 15.0
+        alerts = tracker.update(
+            [{**out, "timestamp": t}, {**back, "timestamp": t}],
+            now=t,
+        )
     assert len(alerts) == 1
 
 
@@ -470,8 +540,9 @@ def test_beaconing_ignores_a_conversation_that_ever_carried_real_traffic():
     page_load = dict(quiet, packets=900, bytes=1_200_000)
     alerts = []
     for i in range(6):
-        batch = [page_load] if i == 1 else [quiet]
-        alerts = tracker.update(batch, now=1000.0 + i * 15.0)
+        t = 1000.0 + i * 15.0
+        batch = [dict(page_load, timestamp=t)] if i == 1 else [dict(quiet, timestamp=t)]
+        alerts = tracker.update(batch, now=t)
     assert not alerts
 
 
@@ -480,8 +551,66 @@ def test_beaconing_ignores_lan_peers():
     lan = _flow(src_ip="192.168.1.50", dst_ip="192.168.1.1", dst_port=443, packets=4)
     alerts = []
     for i in range(6):
-        alerts = tracker.update([lan], now=1000.0 + i * 60.0)
+        t = 1000.0 + i * 60.0
+        alerts = tracker.update([{**lan, "timestamp": t}], now=t)
     assert not alerts
+
+
+def test_beaconing_suppresses_a_p2p_swarm_with_the_same_period():
+    """BitTorrent wakes many peers on one schedule — that is not C2."""
+    tracker = BeaconTracker(
+        BeaconingConfig(min_intervals=4, alert_cooldown_s=0.0, swarm_min_peers=3)
+    )
+    peers = [
+        _flow(
+            src_ip="192.168.1.35",
+            dst_ip=f"185.220.101.{i}",
+            src_port=50000 + i,
+            dst_port=46000 + i,
+            packets=4,
+            bytes=400,
+        )
+        for i in range(5)
+    ]
+    alerts = []
+    for i in range(6):
+        t = 1000.0 + i * 33.0
+        alerts = tracker.update([{**p, "timestamp": t} for p in peers], now=t)
+    assert not alerts
+
+
+def test_beaconing_ignores_bittorrent_service_ports():
+    tracker = BeaconTracker(BeaconingConfig(min_intervals=4, alert_cooldown_s=0.0))
+    bt = _flow(
+        src_ip="192.168.1.35",
+        dst_ip="185.220.101.7",
+        src_port=51000,
+        dst_port=6881,
+        packets=4,
+        bytes=400,
+    )
+    alerts = []
+    for i in range(6):
+        t = 1000.0 + i * 60.0
+        alerts = tracker.update([{**bt, "timestamp": t}], now=t)
+    assert not alerts
+
+
+def test_beaconing_still_flags_a_lone_c2_peer():
+    tracker = BeaconTracker(BeaconingConfig(min_intervals=4, alert_cooldown_s=0.0))
+    beacon = _flow(
+        src_ip="192.168.1.50",
+        dst_ip="185.220.101.7",
+        src_port=51000,
+        dst_port=8080,
+        packets=4,
+        bytes=400,
+    )
+    alerts = []
+    for i in range(6):
+        t = 1000.0 + i * 60.0
+        alerts = tracker.update([{**beacon, "timestamp": t}], now=t)
+    assert any(a["subtype"] == "periodic_beacon" for a in alerts)
 
 
 def test_one_directional_tap_is_reported():
@@ -536,6 +665,21 @@ def test_normal_domain_is_not_flagged():
     assert not alerts
 
 
+def test_github_cdn_label_is_not_dga():
+    alerts = detect_dns_abuse([_dns_flow("glb-db52c2cf8be544.github.com")])
+    assert not [a for a in alerts if a["subtype"] == "dga_domain"]
+
+
+def test_firefox_settings_cdn_is_not_dga():
+    """Long hyphenated Mozilla product labels trip the dns model without an allowlist."""
+    from unipe_ai.features.dns_stats import parent_domain
+
+    qname = "firefox-settings-attachments.cdn.mozilla.net"
+    assert parent_domain(qname) == "mozilla.net"
+    alerts = detect_dns_abuse([_dns_flow(qname)])
+    assert not [a for a in alerts if a["subtype"] == "dga_domain"]
+
+
 @pytest.mark.parametrize(
     "qname",
     [
@@ -544,6 +688,7 @@ def test_normal_domain_is_not_flagged():
         "part-0020.t-0009.fb-t-msedge.net",
         "mozilla-ohttp.fastly-edge.com",
         "incoming.telemetry.mozilla.org",
+        "firefox-settings-attachments.cdn.mozilla.net",
         "static.xx.fbcdn.net",
         # a discord snowflake: all digits, so the vowel and bigram signals
         # fire only because there are no letters to measure
@@ -561,6 +706,31 @@ def test_cdn_hostnames_random_by_design_are_allowlisted():
     label = "dp0wn1kjwhg75"
     assert sum(_dga_signals(label, DnsConfig()).values()) >= 3
     alerts = detect_dns_abuse([_dns_flow(f"{label}.cloudfront.net")])
+    assert not [a for a in alerts if a["subtype"] == "dga_domain"]
+
+
+def test_trained_dns_model_flags_published_dga_families():
+    from unipe_ai.models.dns_ml import load_dns_model
+
+    model = load_dns_model()
+    assert model is not None, "run python train.py to build artifacts/dns_model.json"
+    alerts = detect_dns_abuse([_dns_flow("xkvhdlqpzmwrtn.biz")], model=model)
+    assert any(a["subtype"] == "dga_domain" for a in alerts)
+    assert "dns_ml_probability" in alerts[0]["evidence"]
+
+
+def test_trained_dns_model_spares_benign_and_snowflakes():
+    from unipe_ai.models.dns_ml import load_dns_model
+
+    model = load_dns_model()
+    assert model is not None
+    quiet = [
+        _dns_flow("www.google.com"),
+        _dns_flow("incoming.telemetry.mozilla.org"),
+        _dns_flow("1211781489931452447.discordsays.com"),
+        _dns_flow("dp0wn1kjwhg75.cloudfront.net"),
+    ]
+    alerts = detect_dns_abuse(quiet, model=model)
     assert not [a for a in alerts if a["subtype"] == "dga_domain"]
 
 
@@ -747,6 +917,26 @@ def test_vertical_port_scan_is_flagged():
     assert any(a["subtype"] == "vertical_port_scan" for a in alerts)
 
 
+def test_ephemeral_return_ports_are_not_a_vertical_scan():
+    """RX-only: peers reply onto many local ephemeral ports — that is not recon."""
+    flows = [
+        _flow(
+            src_ip="103.55.88.62",
+            dst_ip="192.168.1.35",
+            src_port=6881,
+            dst_port=40000 + i,
+            packets=2,
+            bytes=120,
+            duration_ms=50,
+            syn_count=1,
+            ack_count=0,
+        )
+        for i in range(80)
+    ]
+    alerts = detect_scanning(flows)
+    assert not any(a["subtype"] == "vertical_port_scan" for a in alerts)
+
+
 def test_horizontal_sweep_is_flagged():
     flows = [
         _flow(
@@ -926,7 +1116,7 @@ def test_detector_wires_up_every_threat_class():
         "volumetric_ddos",
         "ip_spoofing",
         "dns_abuse",
-        "encrypted_malware",
+        "encrypted_anomaly",
         "recon_scanning",
         "data_exfiltration",
     }

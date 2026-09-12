@@ -174,7 +174,7 @@ fn bind_flow_socket(path: &Path) -> anyhow::Result<Clients> {
     let _ = fs::remove_file(path);
     let listener = UnixListener::bind(path)
         .with_context(|| format!("failed to bind {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o666))
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to chmod {}", path.display()))?;
 
     let clients: Clients = Arc::new(Mutex::new(Vec::new()));

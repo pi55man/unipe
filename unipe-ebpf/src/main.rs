@@ -219,6 +219,8 @@ fn try_xdp_packets(ctx: XdpContext) -> Result<u32, ()> {
             _pad: [0; 4],
         };
         let _ = FLOWS.insert(&flow, &record, 0);
+        // new or recycled 5-tuple: drop any leftover handshake for this key
+        let _ = HANDSHAKES.remove(&flow);
     }
 
     // keep watching until a handshake shows up, then sample it exactly once

@@ -7,6 +7,8 @@ AI-based detection of cyber threats in unidirectional IP traffic.
   over a Unix socket.
 - `unipe-ai` — Python detection engine. See [unipe-ai/README.md](unipe-ai/README.md)
   for the models, features, training/validation, throughput and alert schema.
+- `unipe-ui` — Next.js + Tailwind + Tauri desktop shell. Separate Cargo package
+  so it never shares a workspace with the eBPF crates.
 
 The tap is one-way by design: the exporter only reads, the engine only reads the
 socket, and no component can send anything back toward the monitored network.
@@ -16,6 +18,17 @@ cargo build --release -p unipe
 sudo ./target/release/unipe --iface wlan0 --skb   # --skb: wi-fi has no native XDP
 cd unipe-ai && python3 run.py --alerts-out alerts.jsonl
 ```
+
+Desktop UI (does not need root):
+
+```shell
+# with the exporter + engine already running:
+cd unipe-ui && npm install && npm run tauri:dev
+```
+
+The UI polls `/tmp/unipe/alerts.jsonl` and `/tmp/unipe/status.json` written by
+`unipe-ai` (defaults). Top bar shows exporter/engine health and a dark-mode
+toggle. Browser-only `npm run dev` uses mocks / file load.
 
 `sudo ./target/release/unipe --verify` loads the XDP program through the kernel
 verifier and exits, without attaching to any interface.

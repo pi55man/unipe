@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import struct
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 Flow = dict[str, Any]
+LOG = logging.getLogger("unipe_ai.uds")
 
 
 class FlowSocket:
@@ -24,25 +26,36 @@ class FlowSocket:
                 sock.connect(str(self.path))
                 self._sock = sock
                 return
-            except (FileNotFoundError, ConnectionRefusedError):
+            except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError):
                 sock.close()
                 time.sleep(self.retry_secs)
 
     def batches(self) -> Iterator[list[Flow]]:
-        if self._sock is None:
-            raise RuntimeError("not connected")
+        """Yield flow batches forever; reconnect with backoff after disconnect."""
         while True:
-            header = self._recvall(4)
-            if header is None:
-                return
-            (nbytes,) = struct.unpack("<I", header)
-            payload = self._recvall(nbytes)
-            if payload is None:
-                return
-            batch = json.loads(payload)
-            if not isinstance(batch, list):
-                raise TypeError("expected a JSON array of flows")
-            yield batch
+            if self._sock is None:
+                self.connect()
+            while True:
+                try:
+                    header = self._recvall(4)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    header = None
+                if header is None:
+                    break
+                (nbytes,) = struct.unpack("<I", header)
+                try:
+                    payload = self._recvall(nbytes)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    payload = None
+                if payload is None:
+                    break
+                batch = json.loads(payload)
+                if not isinstance(batch, list):
+                    raise TypeError("expected a JSON array of flows")
+                yield batch
+            LOG.warning("flow socket disconnected; reconnecting to %s", self.path)
+            self.close()
+            time.sleep(self.retry_secs)
 
     def close(self) -> None:
         if self._sock is not None:

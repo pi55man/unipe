@@ -5,8 +5,10 @@ from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from unipe_ai.aggregation import IncidentAggregator
 from unipe_ai.alerts import SEVERITY_ORDER
 from unipe_ai.models.beaconing import BeaconingConfig, BeaconTracker
+from unipe_ai.models.dns_ml import DEFAULT_DNS_MODEL_PATH, load_dns_model
 from unipe_ai.models.dnsabuse import DnsConfig, detect_dns_abuse
 from unipe_ai.models.encrypted import EncryptedConfig, detect_encrypted
 from unipe_ai.models.exfiltration import ExfiltrationConfig, detect_exfiltration
@@ -27,15 +29,66 @@ class DetectorConfig:
     # below this we are saying "probably not", so don't spend an analyst's
     # attention on it. blending in a low model score can push a weak rule here.
     min_confidence: float = 0.5
+    # same (subtype, victim) must not re-fire every exporter tick during a flood
+    alert_cooldown_s: float = 60.0
+
 
 FLOOD_SUBTYPES = {"udp_flood", "syn_flood", "fan_in_flood", "icmp_flood"}
 SPOOF_NOISE_SUBTYPES = {"martian_source", "martian_source_storm", "land_attack"}
+# per-flow rate alerts collapse to the destination so a flood is not N×ticks rows
+_RATE_FLOW_SUBTYPES = {
+    "high_rate_flow",
+    "udp_high_rate_flow",
+    "icmp_high_rate_flow",
+    "syn_high_rate_flow",
+}
+
+
+class AlertCooldown:
+    """suppress duplicate alerts for an ongoing incident."""
+
+    def __init__(self, cooldown_s: float) -> None:
+        self.cooldown_s = max(cooldown_s, 0.0)
+        self._last: dict[tuple[Any, ...], float] = {}
+
+    def filter(self, alerts: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+        if self.cooldown_s <= 0:
+            return alerts
+        kept: list[dict[str, Any]] = []
+        for alert in alerts:
+            key = _cooldown_key(alert)
+            last = self._last.get(key)
+            if last is not None and now - last < self.cooldown_s:
+                continue
+            self._last[key] = now
+            kept.append(alert)
+        if len(self._last) > 4096:
+            cutoff = now - self.cooldown_s
+            self._last = {k: t for k, t in self._last.items() if t >= cutoff}
+        return kept
+
+
+def _cooldown_key(alert: dict[str, Any]) -> tuple[Any, ...]:
+    subtype = alert.get("subtype", "")
+    if subtype in FLOOD_SUBTYPES or subtype in _RATE_FLOW_SUBTYPES:
+        return (subtype, alert.get("dst_ip", ""))
+    if subtype in {"vertical_port_scan", "horizontal_sweep"}:
+        return (subtype, alert.get("src_ip", ""), alert.get("dst_ip", ""), alert.get("dst_port", 0))
+    if subtype in SPOOF_NOISE_SUBTYPES:
+        return (subtype, alert.get("dst_ip", ""), alert.get("src_ip", ""))
+    return (alert.get("threat_class"), subtype, alert.get("flow_id", ""))
 
 
 class Detector:
     """Unidirectional IDS detector covering every threat class in the brief."""
 
-    def __init__(self, config_path: Path | None = None, model_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        config_path: Path | None = None,
+        model_path: Path | None = None,
+        dns_model_path: Path | None = None,
+        incidents_path: Path | None = None,
+    ) -> None:
         configs = _load_configs(config_path or _DEFAULT_CONFIG)
         self.detector_cfg: DetectorConfig = configs["detector"]
         self.volumetric_cfg: VolumetricConfig = configs["volumetric"]
@@ -46,7 +99,15 @@ class Detector:
         self.scanning_cfg: ScanningConfig = configs["scanning"]
         self.exfiltration_cfg: ExfiltrationConfig = configs["exfiltration"]
         self.beacons = BeaconTracker(self.beaconing_cfg)
+        # legacy cooldown kept for tests that construct it directly; live path
+        # uses IncidentAggregator (quiet window == alert_cooldown_s).
+        self.cooldown = AlertCooldown(self.detector_cfg.alert_cooldown_s)
+        self.aggregator = IncidentAggregator(
+            incidents_path,
+            quiet_s=self.detector_cfg.alert_cooldown_s,
+        )
         self.model = LogisticModel.load(model_path or DEFAULT_MODEL_PATH)
+        self.dns_model = load_dns_model(dns_model_path or DEFAULT_DNS_MODEL_PATH)
 
     def score(self, features: list[dict[str, Any]], now: float | None = None) -> list[dict[str, Any]]:
         if not features:
@@ -60,7 +121,7 @@ class Detector:
             volumetric
             + spoofing
             + self.beacons.update(features, now)
-            + detect_dns_abuse(features, self.dns_cfg)
+            + detect_dns_abuse(features, self.dns_cfg, self.dns_model)
             + detect_encrypted(features, self.encrypted_cfg)
             + detect_scanning(features, self.scanning_cfg)
             + detect_exfiltration(features, self.exfiltration_cfg)
@@ -68,6 +129,7 @@ class Detector:
         alerts = _dedupe(alerts)
         self._apply_model(alerts, features)
         alerts = [a for a in alerts if a["confidence"] >= self.detector_cfg.min_confidence]
+        alerts = self.aggregator.process(alerts, now)
         alerts.sort(
             key=lambda a: (SEVERITY_ORDER.get(a["severity"], 0), a["confidence"]),
             reverse=True,

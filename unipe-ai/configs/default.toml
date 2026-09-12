@@ -5,6 +5,8 @@ interval_hint_ms = 250
 [detector]
 # drop anything the pipeline is not at least half sure about
 min_confidence = 0.5
+# same flood/scan victim must not re-alert every exporter tick (~250ms)
+alert_cooldown_s = 60.0
 
 [volumetric]
 min_unique_sources = 30
@@ -36,8 +38,12 @@ spoofed_syn_only_fraction = 0.8
 alert_private_to_public = false
 
 [beaconing]
-min_intervals = 4
-max_jitter_ratio = 0.20
+min_intervals = 5
+max_jitter_ratio = 0.15
+# browsers keepalive on 80/443/853; demand a longer, cleaner metronome there
+# 8080 stays on the normal threshold — implants love that port
+web_min_intervals = 8
+web_max_jitter_ratio = 0.08
 min_interval_s = 1.0
 max_interval_s = 3600.0
 # Gates on the busiest window, not the average: a beacon is small every single
@@ -49,9 +55,16 @@ idle_evict_s = 7200.0
 # Both halves of a conversation fold onto one key, so this works whether the
 # tap carries one direction or both. C2 itself must be off-network.
 external_only = true
+# Same host waking many peers on the same period is BitTorrent/P2P, not C2.
+swarm_min_peers = 3
+swarm_interval_slack = 0.25
+ignore_p2p_ports = true
 
 [dns]
-# A label must trip this many of the four randomness signals to count as DGA.
+# trained dns_model.json threshold; signal vote is only the no-model fallback
+dga_model_threshold = 0.55
+# A label must trip this many of the four randomness signals to count as DGA
+# when the trained model artifact is missing.
 dga_min_signals = 3
 dga_max_bigram_familiarity = 0.35
 dga_min_normalized_entropy = 0.90
@@ -67,7 +80,9 @@ dga_ignore_parents = [
   "cloudfront.net", "akamaiedge.net", "akamai.net", "akadns.net",
   "azureedge.net", "trafficmanager.net", "amazonaws.com",
   "googleusercontent.com", "1e100.net", "fastly-edge.com",
-  "fbcdn.net", "windowsupdate.com",
+  "fbcdn.net", "windowsupdate.com", "github.com", "githubusercontent.com",
+  "microsoft.com", "office.com", "google.com", "gstatic.com", "cloudflare.com",
+  "mozilla.net", "mozilla.org", "mozilla.com", "mozgcp.net", "mozaws.net",
 ]
 tunnel_min_qname_len = 60
 tunnel_min_label_count = 4
@@ -88,6 +103,8 @@ min_ports_per_dst = 20
 min_dsts_per_port = 20
 max_avg_packets = 5.0
 min_syn_only_fraction = 0.7
+# Ignore high ephemeral ports so RX-only return traffic is not a "scan".
+max_scan_dst_port = 10000
 
 [exfiltration]
 min_outbound_bytes = 5000000.0

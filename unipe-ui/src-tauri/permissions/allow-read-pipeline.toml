@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-read-pipeline"
+description = "Read alerts and status written by the unipe Python engine"
+commands.allow = ["read_pipeline"]

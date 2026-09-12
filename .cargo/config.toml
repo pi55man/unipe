@@ -1,2 +1,3 @@
 [target."cfg(all())"]
-runner = "sudo -E"
+# eBPF attach needs root. kept as an array so nested crates (tauri) can override.
+runner = ["sudo", "-E"]

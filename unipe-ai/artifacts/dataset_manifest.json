@@ -1,0 +1,69 @@
+{
+  "description": "Lab-faithful synthetic traffic calibrated to the problem statement dataset tools. Retrain with `python train.py`.",
+  "tool_map": {
+    "iperf3": "benign sustained load (tcp/udp throughput)",
+    "browsing": "benign interactive web / tls",
+    "streaming": "benign inbound media",
+    "normal_dns": "benign resolver lookups",
+    "hping3_syn": "volumetric SYN flood",
+    "hping3_udp": "volumetric UDP flood",
+    "icmp_flood": "volumetric ICMP flood",
+    "port_scan": "recon / port scanning",
+    "exfil": "asymmetric outbound data movement",
+    "spoofed": "martian / spoofed sources",
+    "dnscat2": "DNS tunnelling (hex labels)",
+    "iodine": "DNS tunnelling (base32-ish labels)",
+    "dga_conficker": "DGA family conficker-shaped",
+    "dga_cryptolocker": "DGA family cryptolocker-shaped",
+    "dga_necurs": "DGA family necurs-shaped",
+    "dga_banjori": "DGA family banjori-shaped",
+    "c2_beacon": "sandboxed C2 emulator timing (used in beacon eval)"
+  },
+  "flow_model": "flow_model.json",
+  "dns_model": "dns_model.json",
+  "flow_validation": {
+    "accuracy": 0.8228,
+    "precision": 0.9444,
+    "recall": 0.6969,
+    "f1": 0.802,
+    "true_positives": 646,
+    "false_positives": 38,
+    "true_negatives": 835,
+    "false_negatives": 281
+  },
+  "dns_validation": {
+    "accuracy": 0.8808,
+    "precision": 0.8763,
+    "recall": 0.8907,
+    "f1": 0.8835,
+    "true_positives": 1084,
+    "false_positives": 153,
+    "true_negatives": 1030,
+    "false_negatives": 133
+  },
+  "beaconing_eval": {
+    "trials": 200,
+    "accuracy": 1.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "true_positives": 100,
+    "false_positives": 0,
+    "true_negatives": 100,
+    "false_negatives": 0,
+    "note": "synthetic C2 emulator timing vs irregular browsing"
+  },
+  "lab_tool_counts": {
+    "streaming": 484,
+    "hping3_syn": 525,
+    "lan": 505,
+    "port_scan": 482,
+    "browsing": 486,
+    "icmp_flood": 515,
+    "spoofed": 525,
+    "normal_dns": 513,
+    "exfil": 486,
+    "iperf3": 509,
+    "hping3_udp": 467,
+    "idle": 503
+  }
+}
